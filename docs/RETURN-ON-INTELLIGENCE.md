@@ -185,31 +185,28 @@ point; a buyer who wants it even harder to game slides θ<0 toward the min.
 
 ### 4.4 RoI is an INTERVAL, not a number (the honest core)
 
-Lift λ is causal: of the realized value, how much did the AI *cause* vs. what you
-would have done anyway? The fundamental problem of causal inference says you
-cannot observe both the with-AI and without-AI worlds for the same task, so **λ
-is not point-identified.** Pretending it is would be the vagueness this product
-exists to kill. The honest move is **partial identification** (Manski): bound it.
-Selection biases λ up; substitution and concurrency bias measured savings —
-yielding the ordering inequality `λ_old ≤ λ_value ≤ λ_new ≈ TSF`, hence an
-interval, never a point. Because λ enters π multiplicatively and the aggregator
-is monotone, the interval **propagates** — Return on Intelligence is itself
-interval-valued:
+Lift λ is a behavioral, partially identified lens: it asks how the observed
+workflow compares with a disclosed baseline, not whether AI caused the outcome.
+The fundamental problem of causal inference says you cannot observe both the
+with-AI and without-AI worlds for the same task, so **λ is not point-identified.**
+Selection, substitution, and concurrency can move the estimate in different
+directions. We therefore report a disclosed interval and sensitivity range, not a
+causal money credit. A separate registered randomized study is required before
+Fiscus can state a scoped causal effect or net benefit.
 
 ```
 RoI ∈ [RoI_low, RoI_high]      (point = interior estimate)
 ```
 
-The interval's width is set by (a) counterfactual uncertainty and (b)
-instrumentation coverage, and it **tightens monotonically as you wire more gates
-and run controlled comparisons.** This turns the metric into a roadmap: *here is
-your RoI bound, and here is exactly what to instrument to prove your spend's
-worth.* A second honesty result falls out: since every unobserved necessary
-condition is ≤ 1, a partially-instrumented Index is an **upper bound** on the
-true conversion (`indexIsUpperBound`) — so more measurement makes the number more
-honest (usually lower), never inflated. The exact opposite of the usual dashboard
-incentive. (Lenses you haven't wired are excluded and **coverage** is reported —
-unknown ≠ fault.)
+The interval's width is set by (a) baseline/counterfactual uncertainty and (b)
+instrumentation coverage. Additional valid evidence can narrow those assumptions,
+but the observed-only score may move up or down when a missing lens is measured.
+This turns the metric into a roadmap: *here is the observed result, its disclosed
+coverage, and exactly which evidence would reduce the remaining assumptions.*
+Unknown lenses are excluded from the observed-only score and are also represented
+in the full sensitivity interval; `indexIsUpperBound` is retained only as a false
+compatibility value so older consumers cannot mistake the observed score for a
+ceiling.
 
 The identification interval above is not the only width the Index carries. The
 lenses are also *estimated from finite data*, so a second, **statistical** width
@@ -234,19 +231,24 @@ The same evidence projects into two honest objects. The first is unitless and
 comparable; the second is dollars and decides whether to keep paying.
 
 **Face 1 — RoI Index (0–100 + coverage):** the weighted geometric mean above
-(§4.2). Unitless, universal, the dashboard hero. (`roiIndex` in `lenses.ts`.)
+(§4.2). Unitless and scope-limited to the connected lenses and evidence window;
+it is the dashboard hero, not a universal productivity or causal measure.
+(`roiIndex` in `lenses.ts`.)
 
-**Face 2 — RoI return (the money number).** A real, dimensionless ratio,
-computed *directly* as value ÷ cost (`returnRatio` in `lenses.ts`):
+**Face 2 — observed value scenario (the money view).** A descriptive,
+dimensionless ratio computed *directly* as manual-equivalent value ÷ honest cost
+under the disclosed assumptions (`returnRatio` in `lenses.ts`):
 
 ```
                 Σ_realized  baselineMin(u) · (wage/60) · acceptance(u)
-RoI_gross   =  ─────────────────────────────────────────────────────────
+ObservedScenario = ─────────────────────────────────────────────────────────
                   tokenCost   +   supervisionMin · (wage/60)
-
-RoI_causal  =  RoI_gross · λ            (λ = the Lift lens, applied ONCE)
-            ∈ [ RoI_gross·λ_low , RoI_gross·λ_high ]   (Manski interval, §4.4)
 ```
+
+`returnRatio.causalRatio`, `causalRange`, and `paysForItself` remain null on
+this ordinary value spine. A qualified causal-study result is a separate object
+with its own protocol identifier, cost source, outcome, quality guardrail, and
+conservative bound; it is never derived by multiplying this scenario by Lift.
 
 Every term is defended:
 
@@ -264,15 +266,24 @@ Every term is defended:
   evidence does (METR's ~1.4–2× value, not the ~3× raw speed). The metric
   **refuses to print a dollar return** until supervision time is measured — it
   will not invent the denominator (`basis: 'none'`).
-- **The counterfactual λ is applied exactly once.** `RoI_gross` is an honest
-  **upper bound** on the causal return (it does not subtract what you'd have done
-  anyway); multiplying by the Lift lens λ once yields `RoI_causal`. We do **not**
-  also fold the speedup into a separate "leverage" term — that would count the
-  time-savings twice (it already lives in the manual-vs-AI time ratio *and* in λ).
-  Keeping the money number independent of the Index is what avoids the
-  double-count. **RoI_causal ≥ 1 ⟺ the AI paid for itself**; METR's "19 % slower"
-  is the RoI < 1 case, which the metric flags. (The `breakEven` helper is the
-  RoI = 1 line.)
+- **Behavioural Lift is an observational lens, not a causal money credit.**
+  The historical `RoI_gross` / `RoI_causal` terminology describes a formula
+  from before Fiscus had a dedicated causal-evidence lane. Behavioural Lift, a
+  time-speed estimate, and a manual-equivalent valuation do not establish the
+  outcome that would have occurred without AI. The current product therefore
+  renders this money value only as an **observed/manual-equivalent value
+  scenario** and keeps the legacy causal fields null.
+
+  A future Fiscus causal net-benefit result is deliberately a separate object.
+  It requires the registered randomized-study conditions in
+  [CAUSAL-EVIDENCE-PROTOCOL.md](CAUSAL-EVIDENCE-PROTOCOL.md): frozen
+  intervention/control definitions, pre-exposure random assignment, completed
+  execution and outcome lineage, explicit cost-source classification, a
+  predeclared value or quality guardrail, and a conservative lower confidence
+  bound. A model-versus-model experiment can support a scoped comparative
+  claim; an AI-paid-for-itself claim additionally needs a no-AI or incumbent
+  control, full-cost accounting for both arms, a currency/measured-labour
+  outcome basis, and a positive lower bound on causal net benefit.
 
 The two faces differ by Jensen's inequality (value sums dollars per-unit; the
 Index composes lenses) — correct, because one is a sum of dollars and the other a
@@ -337,10 +348,10 @@ invention is the synthesis**, which has not been built:
    The funnel chain-rule makes value multiplicative; multiplicative consistency
    then forces the geometric mean via the Kolmogorov–Nagumo characterization
    (§4.2). The Goodhart-resistance is a theorem, not a hope.
-3. **Interval-valued, honest-by-construction.** RoI is a bound, not a false
-   point: its width is set by counterfactual uncertainty + coverage, and it
-   tightens with evidence (§4.4). A partially-instrumented Index is an explicit
-   upper bound — more measurement, more honest, never inflated.
+3. **Interval-valued, honest-by-construction.** RoI exposes a point together with
+   its stated baseline, coverage, and sensitivity range rather than a false
+   universal guarantee. Valid evidence may narrow uncertainty, while measuring a
+   missing lens can move the observed score in either direction (§4.4).
 4. **Cross-modality, measured from the wire.** The universal
    intent→acceptance→outcome spine measures value from *any* token spend (not just
    commits), from the proxy path — solving the "attribution blindness" DORA/SPACE
@@ -378,8 +389,9 @@ hand-wavy.
   signals) through the same proxy + `report` spine, so RoI covers all token use.
 
 Until a signal is wired, its lens reads `uninstrumented` and the index is honest
-about coverage. The path to a higher, more trusted number is to wire more — never
-to game one.
+about coverage. The path to a more trusted number is to instrument the next
+evidence source, inspect the sensitivity result, and preserve the possibility that
+the measured value moves either way — never to game one lens.
 
 ---
 
@@ -721,9 +733,9 @@ gamed metric both trip it. Its job is to force the question no dashboard asks �
 
 ## 12. Value of Information — which measurement to buy next
 
-The Index is an upper bound while lenses are missing (§5), but "wire more
-lenses" is not a decision — "wire **this** lens next" is. For each
-un-instrumented lens k, evaluate the composite with that lens hypothetically
+Missing lenses create unmeasured exposure, not a universal upper-bound theorem
+(§4.4). "Wire more lenses" is not a decision — "wire **this** lens next" is. For
+each un-instrumented lens k, evaluate the composite with that lens hypothetically
 measured at a **disclosed neutral reference** v = 0.5 (a midpoint, not a
 prediction):
 
@@ -732,9 +744,11 @@ Index_k(v) = 100 · exp( (Σᵢ wᵢ ln xᵢ + w_k ln v) / (Σᵢ wᵢ + w_k) )
 ```
 
 and rank by the size of the move. The arithmetic is fully transparent — no
-hidden priors; a heavier, further-from-current lens moves the Index more, and
-measuring can only make the number more honest. This completes the decision
-calculus the instrument hands an organization:
+hidden priors. A heavier, further-from-current lens moves the Index more at this
+reference, but the actual measured value may move it either direction. The output
+is a sensitivity calculation that names the cheapest assumption to reduce, not a
+promise about the result. This completes the decision calculus the instrument
+hands an organization:
 
 | Question | Answer | Section |
 |---|---|---|

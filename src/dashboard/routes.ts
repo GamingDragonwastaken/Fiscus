@@ -20,7 +20,8 @@ import { reconciliationReadiness } from '../billing/readiness.ts';
 import { existsSync, statSync } from 'node:fs';
 import type { Store } from '../store/db.ts';
 import { isDemo, type FiscusConfig } from '../config.ts';
-import { buildSettingsSnapshot, applySettingsPatch, type SettingsPatch } from './settings.ts';
+import { probeProxyState } from '../egress/proxyHealth.ts';
+import { buildSettingsSnapshot, applySettingsPatch, SettingsValidationError, type SettingsPatch } from './settings.ts';
 import { serveHtml } from './static.ts';
 import { startOfLocalDay } from '../budget/guard.ts';
 import { loadRealization, realizeDiscoveredProjects } from '../value/realization.ts';
@@ -42,6 +43,9 @@ import { judgeSessionFromStore } from '../judge/orchestrate.ts';
 import { resolveJudgeTier, hasHostedJudgeApiKey } from '../judge/tier.ts';
 import { pricingStatus } from '../cost/pricing.ts';
 import { pricingCoverage } from '../cost/coverage.ts';
+import { verifyBlockedAssignmentPlan } from '../causal/assignment.ts';
+import { estimateCausalStudy } from '../causal/estimate.ts';
+import { stringifyJson } from '../util/json.ts';
 
 /**
  * Config persistence is injectable so the dashboard can be exercised without
@@ -103,8 +107,11 @@ export interface Route {
 }
 
 export function json(res: http.ServerResponse, status: number, payload: unknown): void {
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
-  res.end(JSON.stringify(payload));
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+  });
+  res.end(stringifyJson(payload, 0));
 }
 
 /** Only honor a ?repo= that is an existing directory; otherwise the dashboard's cwd. */
@@ -412,6 +419,10 @@ export function handleBilling({ res, store }: RouteContext): void {
       // warning was written for — it says nothing at all. Same computation the
       // CLI prints, imported rather than reimplemented.
       readiness: reconciliationReadiness(store),
+      // Exact imported-record mapping coverage is a read-only accounting
+      // projection. Operator declarations stay visibly separate from provider
+      // authority and cannot enter request spend, budgets, RoI, or advice.
+      mapping: store.billingMappingCoverage(),
       // Explicit, read-only provider API observations use a different
       // source contract from imported operator reports. They remain a
       // separate snapshot/status surface and never become overview spend.
@@ -537,6 +548,7 @@ export function handleExportCsv({ res, url, store }: RouteContext): void {
     res.writeHead(200, {
       'content-type': 'text/csv; charset=utf-8',
       'content-disposition': `attachment; filename="fiscus-${safe}.csv"`,
+      'cache-control': 'no-store',
     });
     res.end(csv);
   } catch (err) {
@@ -564,18 +576,13 @@ export function handleGuide({ res, store, config }: RouteContext): void {
     try {
       const now = Date.now();
       const day = 24 * 60 * 60 * 1000;
-      let proxyUp = false;
-      try {
-        const r = await fetch(`http://localhost:${config.port}/__fiscus/health`, { signal: AbortSignal.timeout(500) });
-        proxyUp = r.ok;
-      } catch {
-        proxyUp = false;
-      }
+      const proxyStatus = await probeProxyState(config);
       return json(res, 200, buildGuide({
         demo: isDemo(),
         port: config.port,
         dashboardPort: config.dashboardPort,
-        proxyUp,
+        proxyUp: proxyStatus.kind === 'up',
+        proxyStatus,
         requestsAllTime: store.summary(0, now + 1000).requests,
         spend30dUsd: store.summary(now - 30 * day, now + 1000).costUsd,
         dailyCapUsd: config.budget.dailyUsd,
@@ -709,6 +716,72 @@ export function handleValue({ res, url, store, config }: RouteContext): void {
 }
 
 /**
+ * Read-only causal-study inspector. It intentionally omits randomisation
+ * material and raw record payloads: the dashboard gets the evidence state,
+ * protocol hash, counts, and replay verdict, while local CLI/export tooling
+ * remains the controlled surface for detailed evidence handling.
+ */
+export function handleCausal({ res, url, store }: RouteContext): void {
+  try {
+    const summaries = store.causalStudySummaries();
+    const requested = url.searchParams.get('study');
+    const selected = requested
+      ? summaries.find((summary) => summary.studyId === requested) ?? null
+      : summaries[0] ?? null;
+    if (requested && !selected) {
+      return json(res, 404, { error: 'causal study not found', studyId: requested });
+    }
+    if (!selected) {
+      return json(res, 200, {
+        demo: isDemo(),
+        generatedAt: new Date().toISOString(),
+        studies: [],
+        study: null,
+        causalEvidence: 'No publicly inspectable retained version-1 causal study. Version-2 public projection is deferred. Value output remains an observed/manual-equivalent scenario.',
+        boundary: 'Read-only local status. This endpoint cannot change routing, budgets, or provider configuration.',
+      });
+    }
+    const data = store.causalStudyData(selected.studyId);
+    if (!data) throw new Error('causal summary exists without its local protocol');
+    const estimate = estimateCausalStudy(data);
+    const assignmentReplay = store.causalAssignmentPlans(selected.studyId).map((plan) => ({
+      blockId: plan.blockId,
+      allocationHash: plan.allocationHash,
+      errors: verifyBlockedAssignmentPlan(data.protocol, plan),
+    }));
+    return json(res, 200, {
+      demo: isDemo(),
+      generatedAt: new Date().toISOString(),
+      studies: summaries,
+      study: {
+        studyId: selected.studyId,
+        protocolHash: data.protocol.protocolHash,
+        committedAtMs: data.protocol.committedAtMs,
+        question: data.protocol.question,
+        counts: {
+          decisions: data.decisions.length,
+          executions: data.executions.length,
+          outcomes: data.outcomes.length,
+        },
+        qualification: estimate.qualification,
+        allowedClaim: estimate.allowedClaim,
+        assignmentReplay,
+      },
+      causalEvidence: 'Local randomized-study evidence only. Ordinary Lift, pricing, and value scenarios cannot create a causal claim.',
+      boundary: 'Read-only local status. This endpoint cannot change routing, budgets, or provider configuration.',
+    });
+  } catch (err) {
+    if (typeof err === 'object' && err !== null && Reflect.get(err, 'code') === 'CAUSAL_INTEGRITY_FAILURE') {
+      return json(res, 409, {
+        error: 'CAUSAL_INTEGRITY_FAILURE',
+        causalEvidence: 'Stored causal evidence failed integrity verification. Public causal projection is unavailable until the local Store is repaired.',
+      });
+    }
+    return json(res, 500, { error: String(err) });
+  }
+}
+
+/**
  * Settings snapshot for the dashboard's Settings view — read-only, no local-header
  * guard needed (same-machine-only already enforced by the loopback Host check).
  */
@@ -728,7 +801,16 @@ export function handleSettingsUpdate({ req, res, store, config, version, configP
   void (async () => {
     try {
       const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
+      let bytes = 0;
+      for await (const c of req) {
+        const chunk = c as Buffer;
+        bytes += chunk.byteLength;
+        if (bytes > 16 * 1024) {
+          req.resume();
+          throw new SettingsValidationError('request body exceeds the 16 KiB settings limit');
+        }
+        chunks.push(chunk);
+      }
       const patch = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as SettingsPatch;
       const current = configPersistence.load();
       const next = applySettingsPatch(current, patch);
@@ -747,7 +829,13 @@ export function handleSettingsUpdate({ req, res, store, config, version, configP
       Object.assign(config, next);
       return json(res, 200, buildSettingsSnapshot(store, config, version));
     } catch (err) {
-      return json(res, 500, { error: String(err) });
+      if (err instanceof SettingsValidationError) {
+        return json(res, 400, { error: { code: err.code, message: err.message } });
+      }
+      if (err instanceof SyntaxError) {
+        return json(res, 400, { error: { code: 'SETTINGS_INVALID_JSON', message: 'settings request body must be valid JSON' } });
+      }
+      return json(res, 500, { error: { code: 'SETTINGS_UPDATE_FAILED', message: 'settings could not be persisted' } });
     }
   })();
 }
@@ -797,6 +885,7 @@ export const ROUTES: readonly Route[] = [
   { path: '/api/guide', methods: ['GET', 'HEAD'], handler: handleGuide },
   { path: '/api/judge', methods: ['POST'], localOnly: ['POST'], handler: handleJudge },
   { path: '/api/value', methods: ['GET', 'HEAD'], handler: handleValue },
+  { path: '/api/causal', methods: ['GET', 'HEAD'], handler: handleCausal },
   // Reads GET only, but has always advertised 'GET, POST' on the 405 — the
   // POST that Settings actually performs goes to /api/settings/update. The
   // header is preserved verbatim rather than "corrected": it is part of the

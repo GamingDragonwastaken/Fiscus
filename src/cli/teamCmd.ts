@@ -10,6 +10,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Store } from '../store/db.ts';
 import { loadConfig, dbPath, fiscusHome } from '../config.ts';
+import { discardResponseBody, egressFetch, EgressError, type EgressErrorCode } from '../egress/transport.ts';
 import { isGitRepo, projectName } from '../git/correlate.ts';
 import {
   computeRealization,
@@ -30,7 +31,7 @@ import {
 } from '../value/receipt.ts';
 import { buildRollupBody, signRollup, type SignedRollup } from '../team/rollup.ts';
 import { judgeSessionFromStore } from '../judge/orchestrate.ts';
-import { C, color, usd, pct, printNotAGitRepo } from './ui.ts';
+import { C, color, usd, pct, printNotAGitRepo, printJson } from './ui.ts';
 import { type Flags } from './flags.ts';
 
 export async function cmdTeam(flags: Flags): Promise<void> {
@@ -50,7 +51,7 @@ export async function cmdTeam(flags: Flags): Promise<void> {
     const view = selfView(rows, flags.me, opts);
     store.close();
     if (flags.json) {
-      process.stdout.write(JSON.stringify(view, null, 2) + '\n');
+      printJson(view);
       return;
     }
     console.log('');
@@ -79,7 +80,7 @@ export async function cmdTeam(flags: Flags): Promise<void> {
   const rep = computeCohort(store, { ...window, ...opts });
   store.close();
   if (flags.json) {
-    process.stdout.write(JSON.stringify(rep, null, 2) + '\n');
+    printJson(rep);
     return;
   }
   console.log('');
@@ -288,7 +289,7 @@ export async function cmdJudge(flags: Flags): Promise<void> {
   store.close();
 
   if (flags.json) {
-    process.stdout.write(JSON.stringify(judgment, null, 2) + '\n');
+    printJson(judgment);
     return;
   }
 
@@ -323,7 +324,15 @@ type PushResult =
   | { status: 'empty'; message: string }
   | { status: 'dry-run'; signed: SignedRollup }
   | { status: 'ok'; keyId: string; projectCount: number }
-  | { status: 'error'; message: string };
+  | { status: 'error'; message: string; failureCode?: TeamPushFailureCode; action?: string };
+
+type TeamPushFailureCode = `egress_${EgressErrorCode}` | 'network_error';
+
+function egressRepairAction(code: EgressErrorCode): string | undefined {
+  return code === 'receipt_integrity_failed' || code === 'receipt_persistence_failed'
+    ? 'Repair or restore the local receipt history before retrying; if the lock is stale, confirm no Fiscus writer is active, then remove only that lock and rerun verify.'
+    : undefined;
+}
 
 /**
  * Team rollups can include the local developer's numeric usage and outcome
@@ -382,7 +391,9 @@ async function signAndPushRollup(
   }
 
   try {
-    const res = await fetch(opts.url!.replace(/\/$/, '') + '/rollups', {
+    const res = await egressFetch(opts.url!.replace(/\/$/, '') + '/rollups', {
+      purpose: 'team_rollup',
+      dataClass: 'team_rollup',
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(signed),
@@ -391,11 +402,21 @@ async function signAndPushRollup(
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
       const message = `push failed: HTTP ${res.status} from ${opts.url}${detail ? ` — ${detail.slice(0, 200)}` : ''}`;
-      return { status: 'error', message };
+      return { status: 'error', message, failureCode: 'network_error' };
     }
+    await discardResponseBody(res);
     return { status: 'ok', keyId: opts.keys.keyId, projectCount: projects.length };
   } catch (e) {
-    return { status: 'error', message: `push failed: ${String(e)}` };
+    if (e instanceof EgressError) {
+      const action = egressRepairAction(e.code);
+      return {
+        status: 'error',
+        message: `Fiscus egress boundary refused team push (${e.code}): ${e.message}${action ? ` ${action}` : ''}`,
+        failureCode: `egress_${e.code}`,
+        action,
+      };
+    }
+    return { status: 'error', message: `push failed: ${String(e)}`, failureCode: 'network_error' };
   }
 }
 
@@ -528,7 +549,7 @@ export async function cmdTeamPush(flags: Flags): Promise<void> {
 
   if (result.status === 'error') {
     if (flags.json) {
-      console.log(JSON.stringify({ ok: false, error: result.message }, null, 2));
+      console.log(JSON.stringify({ ok: false, error: result.message, failureCode: result.failureCode, action: result.action }, null, 2));
       process.exitCode = 1;
       return;
     }

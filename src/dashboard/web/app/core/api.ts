@@ -105,6 +105,31 @@ export interface ReconciliationReadiness {
   coverage: ReconciliationCoverage | null;
 }
 
+/**
+ * Exact imported-record mapping coverage. This is intentionally a narrow GUI
+ * projection of the server payload: the dashboard can explain residuals and
+ * trust, but it cannot author a mapping or treat an operator declaration as a
+ * provider-verified account binding.
+ */
+export interface BillingMappingCoveragePayload {
+  coverageStatus: string;
+  reconciliationStatus: string;
+  reconciliationDetail: string;
+  providerScopeAuthority: string;
+  mappingTrust: string;
+  totalRecordCount: number;
+  mappedRecordCount: number;
+  unmappedRecordCount: number;
+  staleMappingRecordCount: number;
+  ambiguousMappingRecordCount: number;
+  totalMicros: number;
+  mappedMicros: number;
+  residualMicros: number;
+  byStatus: Record<string, { recordCount: number; amountMicros: number }>;
+  targets: Array<{ targetProject: string; targetAccountRef: string; recordCount: number; amountMicros: number }>;
+  excludedFrom: string[];
+}
+
 export interface BillingPayload {
   demo: boolean;
   evidence: { reconciliationStatus: string };
@@ -115,6 +140,8 @@ export interface BillingPayload {
    * `ready: false` — collapsing the two would invent a reassurance.
    */
   readiness?: ReconciliationReadiness;
+  /** Exact imported-record mapping coverage; absent only for pre-mapping payloads. */
+  mapping?: BillingMappingCoveragePayload;
   /**
    * The immutable reconciliation runs, newest first — the collection the server
    * actually sends (`store.reconciliationRuns(10)`), not a count.
@@ -247,7 +274,7 @@ export interface ValuePayload {
   roi?: {
     roiIndex?: number | null;
     roiInterval?: { low: number | null; high: number | null } | null;
-    /** True when the index can only be read as a ceiling, not a point estimate. */
+    /** Deprecated compatibility flag; the observed score is not a ceiling when lenses are missing. */
     indexIsUpperBound?: boolean;
     coverage?: number | null;
     /** The money claim. `realizedValueUsd` here IS value, not cost. */
@@ -260,6 +287,7 @@ export interface ValuePayload {
       counterfactualCredit?: number | null;
       supervisionPriced?: boolean;
       paysForItself?: boolean | null;
+      evidenceState?: 'unpriced' | 'observational_scenario';
       basis?: string;
     } | null;
     tokenCostUsd?: number;
@@ -311,6 +339,43 @@ export interface BudgetAdvice {
   windowDays?: number;
 }
 
+/** Read-only summary of Fiscus's separate causal-study evidence lane. */
+export interface CausalPayload {
+  demo: boolean;
+  generatedAt: string;
+  studies: Array<{
+    studyId: string;
+    protocolHash: string;
+    committedAtMs: number;
+    decisions: number;
+    executions: number;
+    outcomes: number;
+    latestAnalysis: { analysisId: string; computedAtMs: number; state: string } | null;
+  }>;
+  study: {
+    studyId: string;
+    protocolHash: string;
+    committedAtMs: number;
+    question: 'model_cost_quality' | 'ai_vs_incumbent_net_benefit';
+    counts: { decisions: number; executions: number; outcomes: number };
+    qualification: {
+      state: 'collecting' | 'invalid' | 'inconclusive' | 'qualified';
+      evidenceGrade: string;
+      reasons: string[];
+      countsByArm: Record<string, {
+        assigned: number;
+        completed: number;
+        missing: number;
+        adherenceConfirmed: number;
+      }>;
+    };
+    allowedClaim: 'not_established' | 'comparative_cost_quality_supported' | 'causal_net_benefit_supported';
+    assignmentReplay: Array<{ blockId: string; allocationHash: string; errors: string[] }>;
+  } | null;
+  causalEvidence: string;
+  boundary: string;
+}
+
 /**
  * Mirrors `BudgetConfig` in src/config.ts EXACTLY. Verified against that file and
  * against a live /api/settings response, not written from memory: the first
@@ -346,6 +411,26 @@ export interface SettingsSnapshot {
   metadataOnly: boolean;
   budget: BudgetConfig;
   enforcement: BudgetEnforcement;
+  egress: {
+    mode: 'local_locked' | 'controlled_cloud';
+    rules: Array<{
+      id: string;
+      enabled: boolean;
+      purpose: string;
+      dataClass: string;
+      method: string;
+      origin: string;
+      pathPrefix: string;
+    }>;
+    receipts: {
+      path: string;
+      ok: boolean;
+      receiptCount: number;
+      validThroughHash: string | null;
+      errors: string[];
+    };
+    scope: string;
+  };
   connections: Array<Record<string, unknown>>;
 }
 
@@ -457,9 +542,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => request<HealthPayload>('/api/health'),
-  overview: (range: string) => request<Overview>(`/api/overview?range=${encodeURIComponent(range)}`),
+  overview: (range: string, signal?: AbortSignal) => request<Overview>(
+    `/api/overview?range=${encodeURIComponent(range)}`,
+    signal ? { signal } : undefined,
+  ),
   billing: () => request<BillingPayload>('/api/billing'),
   allocation: () => request<AllocationPayload>('/api/allocation'),
+  causal: (studyId?: string) => request<CausalPayload>(
+    studyId ? '/api/causal?study=' + encodeURIComponent(studyId) : '/api/causal',
+  ),
   value: () => request<ValuePayload>('/api/value'),
   settings: () => request<SettingsSnapshot>('/api/settings'),
   guide: () => request<Record<string, unknown>>('/api/guide'),

@@ -7,6 +7,7 @@
 // re-exec ourselves once with --disable-warning to keep output clean. This is
 // the only knob that reliably suppresses it for `npx fiscus`.
 import { spawnSync } from 'node:child_process';
+import { acquirePublicationLock } from './publication-lock.mjs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -30,8 +31,28 @@ if (!process.env.__FISCUS_CHILD) {
     ['--disable-warning=ExperimentalWarning', self, ...process.argv.slice(2)],
     { stdio: 'inherit', env: { ...process.env, __FISCUS_CHILD: '1' } },
   );
-  process.exit(result.status ?? 0);
+  if (result.error) {
+    console.error(`Fiscus could not start its runtime: ${result.error.message}`);
+    process.exit(1);
+  }
+  if (typeof result.status === 'number') process.exit(result.status);
+  console.error(`Fiscus runtime terminated by signal ${result.signal ?? 'unknown'}`);
+  process.exit(1);
 } else {
   const here = dirname(self);
-  await import(pathToFileURL(join(here, '..', 'dist', 'cli.js')).href);
+  // The launcher participates in the same exclusive gate as publication.
+  // Acquiring (rather than merely checking) the lock closes the race where a
+  // build starts immediately after a reader's old existsSync check. Lock
+  // failure is intentionally fatal: bypassing it would make a reader's
+  // artifact guarantee depend on an unverified filesystem assumption.
+  const release = acquirePublicationLock(join(here, '..'));
+
+  try {
+    // Direct imports of dist/* and tools such as npm pack do not participate
+    // in this gate; the atomic reader guarantee is intentionally limited to
+    // the supported bin launcher and the build protocol.
+    await import(pathToFileURL(join(here, '..', 'dist', 'cli.js')).href);
+  } finally {
+    release?.();
+  }
 }
