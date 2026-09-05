@@ -44,9 +44,17 @@ web/
 - **The GUI reaches for CLI parity, and says where it has not.** `registry.ts` is
   the single source for navigation, action cards, and the parity table rendered
   in System. A capability with no screen is visible in the product as unbuilt.
+- **The test prerequisite is explicit.** `npm test` performs a full build before
+  running tests because package-boundary checks inspect both browser and Node
+  artifacts in `dist/`. The build script's `--web` mode remains a targeted GUI
+  iteration tool, not the ordinary test contract.
 - **Nothing happens without a preview.** Every action opens the drawer, which
   states the consequence in words, shows the computed preview, prints the
   equivalent command, and only then offers the commit.
+- **Classic is an explicitly legacy compatibility view.** `/classic` preserves
+  the earlier single-file dashboard and its direct settings controls; it does
+  not provide the modern preview-first action flow and must not be presented as
+  GUI parity. The modern `/` surface is the preview/consequence/apply contract.
 - **Consequence tiers gate the commit**: `read` has none, `local` needs a loaded
   preview, `credential` and `egress` name what is read or sent, `destructive`
   requires typing the capability id.
@@ -118,6 +126,11 @@ web/
 - **The browser app never imports node code, and the server never imports the
   browser app.** Enforced structurally: `app/tsconfig.json` has the DOM lib and
   no node types, and the root configs exclude `app/**`.
+- **Asynchronous evidence is announced.** Modern loading/error states expose
+  status/alert semantics, and the classic view exposes current navigation/range
+  state plus a text alternative for the spend chart. Source contracts improve
+  the baseline, but they do not replace exact-candidate browser and screen-reader
+  verification in the release gate.
 - **A claim's meaning is derived, not fetched.** `claimLayers.ts` turns four
   payloads into four claims as a PURE function; `chain.ts` only reads the
   endpoints. The claims are where this product commits itself, so they must be
@@ -151,6 +164,11 @@ web/
   reads `isPrecise()` inside a host effect is rebuilt in place, so its listeners
   and focus traps release through `onCleanup` — which runs before the next run —
   and never through a nested effect watching for close.
+- **View effects are scoped to their rendered region.** View factories use
+  `scopedEffect`, which registers their disposer with the active render binding;
+  navigation therefore tears down fetch subscriptions. The Metered range fetch
+  also aborts/sequence-checks stale responses and rejects a payload whose
+  declared range differs from the selected range.
 - **The Claim Inspector reads and never acts.** The drawer owns everything that
   changes state. A panel that argues the evidence and offers the button in the
   same box is the shape of every tool this one exists to disagree with.

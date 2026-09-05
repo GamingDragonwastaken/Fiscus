@@ -14,7 +14,21 @@
 
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import {
+  closeSync,
+  copyFileSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeSync,
+} from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { validateEgressRule } from './egress/ruleValidation.ts';
 
 export interface BudgetConfig {
   /** Hard daily cap in USD. Requests are blocked once exceeded. null = unlimited. */
@@ -35,6 +49,47 @@ export interface BudgetConfig {
    * the cap govern total observed AI spend instead of blockable spend.
    */
   capIncludesImported: boolean;
+}
+
+/** Highest USD value that can still round to an exact safe microdollar integer. */
+export const MAX_SAFE_USD = Number.MAX_SAFE_INTEGER / 1_000_000;
+const MAX_RUNAWAY_WINDOW_SEC = 366 * 24 * 60 * 60;
+
+export class ConfigValidationError extends Error {
+  readonly code = 'CONFIG_INVALID';
+
+  constructor(message: string) {
+    super(`CONFIG_INVALID: ${message}`);
+    this.name = 'ConfigValidationError';
+  }
+}
+
+function validNullableUsd(value: unknown): value is number | null {
+  return value === null || (
+    typeof value === 'number'
+    && Number.isFinite(value)
+    && value >= 0
+    && value <= MAX_SAFE_USD
+  );
+}
+
+/** Validate the budget object before it can reach enforcement or persistence. */
+export function validateBudgetConfig(value: unknown): asserts value is BudgetConfig {
+  if (!isRecord(value)) throw new ConfigValidationError('budget must be an object');
+  for (const key of ['dailyUsd', 'dailySoftUsd', 'sessionUsd', 'runawayMaxUsd'] as const) {
+    if (!validNullableUsd(value[key])) {
+      throw new ConfigValidationError(`budget.${key} must be null or a finite non-negative USD value`);
+    }
+  }
+  if (typeof value.runawayWindowSec !== 'number'
+      || !Number.isFinite(value.runawayWindowSec)
+      || value.runawayWindowSec <= 0
+      || value.runawayWindowSec > MAX_RUNAWAY_WINDOW_SEC) {
+    throw new ConfigValidationError(`budget.runawayWindowSec must be a finite positive value no greater than ${MAX_RUNAWAY_WINDOW_SEC}`);
+  }
+  if (typeof value.capIncludesImported !== 'boolean') {
+    throw new ConfigValidationError('budget.capIncludesImported must be boolean');
+  }
 }
 
 export interface AlertsConfig {
@@ -84,8 +139,9 @@ export interface PricingConfig {
   maxAgeDays: number;
   /**
    * When true, `fiscus start` refreshes pricing on launch if the cache is
-   * older than maxAgeDays. OFF by default to keep "zero external requests" true
-   * out of the box — the manual `fiscus pricing --refresh` always works.
+   * older than maxAgeDays. OFF by default so a normal local start has no
+   * optional manifest request. Any refresh still needs a matching controlled
+   * cloud egress rule; a denied refresh leaves the active local table intact.
    */
   autoRefresh: boolean;
 }
@@ -112,7 +168,9 @@ export interface JudgeConfig {
    * Local OpenAI-compatible inference server for the AI-side Lift judge (e.g. a
    * local Ollama). null = the local-LLM judge tier is off. A separate field from
    * upstreams.openai on purpose — judge calls are never metered proxy traffic and
-   * must never share a base URL with what's actually being measured.
+   * must never share a base URL with what's actually being measured. The tier's
+   * egress evidence treats only a validated loopback URL as on-device; another
+   * configured URL is reported as remote/off-device.
    */
   localBaseUrl: string | null;
   /**
@@ -157,6 +215,50 @@ export interface JudgeConfig {
   hostedSendFullContent: boolean;
 }
 
+/**
+ * A permission is specific to why Fiscus is sending a request and what class of
+ * data the request may carry. A rule never acts as a generic network wildcard.
+ */
+export type EgressPurpose =
+  | 'provider_inference'
+  | 'pricing_refresh'
+  | 'baseline_refresh'
+  | 'alert_delivery'
+  | 'provider_cost_observation'
+  | 'team_rollup'
+  | 'hosted_judge'
+  | 'local_judge'
+  | 'local_healthcheck';
+
+export type EgressDataClass =
+  | 'provider_request'
+  | 'pricing_manifest'
+  | 'baseline_manifest'
+  | 'alert_metadata'
+  | 'provider_cost_aggregate'
+  | 'team_rollup'
+  | 'judge_structural_summary'
+  | 'judge_transcript_excerpt'
+  | 'healthcheck';
+
+export interface EgressRule {
+  id: string;
+  enabled: boolean;
+  purpose: EgressPurpose;
+  dataClass: EgressDataClass;
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD';
+  /** Exact HTTPS origin only: no credential, query, fragment, or wildcard. */
+  origin: string;
+  /** Absolute leading path prefix only; query matching is never delegated to a rule. */
+  pathPrefix: string;
+}
+
+export interface EgressConfig {
+  /** Local mode refuses every non-loopback Fiscus HTTP(S) target before DNS. */
+  mode: 'local_locked' | 'controlled_cloud';
+  rules: EgressRule[];
+}
+
 export interface FiscusConfig {
   port: number;
   dashboardPort: number;
@@ -186,14 +288,15 @@ export interface FiscusConfig {
   judge: JudgeConfig;
   pricing: PricingConfig;
   perUser: PerUserConfig;
+  egress: EgressConfig;
   /** Prune request rows older than this many days during maintenance. */
   retentionDays: number;
   /**
    * When true, the proxy stores ONLY token/cost metadata and skips capturing
    * proposed-edit content. That turns OFF First-Pass Acceptance (the proposal⇄commit
    * diff needs the AI's proposed lines stored locally). Default false so the signal
-   * works out of the box. Either way nothing is ever sent off-device — this only
-   * controls what is persisted in the local DB.
+   * works out of the box. This only controls what is persisted in the local DB;
+   * provider traffic still follows the configured egress boundary.
    */
   metadataOnly: boolean;
   /**
@@ -261,6 +364,12 @@ export const DEFAULT_CONFIG: FiscusConfig = {
   perUser: {
     enabled: false,
     minCohort: 5,
+  },
+  // Strong default: local operation works immediately, while any cloud route
+  // needs a deliberate, inspectable exact rule created through `fiscus egress`.
+  egress: {
+    mode: 'local_locked',
+    rules: [],
   },
   retentionDays: 180,
   metadataOnly: false,
@@ -374,24 +483,98 @@ function deepMerge<T>(base: T, override: Partial<T>): T {
   return out as T;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** TCP ports are finite, integral values in the IANA-assigned 1..65535 range. */
+function sanitizePort(value: unknown, fallback: number): number {
+  return typeof value === 'number'
+    && Number.isFinite(value)
+    && Number.isInteger(value)
+    && value >= 1
+    && value <= 65535
+    ? value
+    : fallback;
+}
+
+/**
+ * JSON configuration is an untrusted boundary. Deep merge is useful for the
+ * broad config surface, but it cannot decide whether an egress object is
+ * authorization data. An absent or ambiguous egress object therefore returns
+ * the local-locked default; a controlled-cloud object must have an exact mode,
+ * an array of exact rule shapes, and boolean enabled flags.
+ */
+function sanitizeEgressConfig(value: unknown): EgressConfig {
+  if (!isRecord(value)) return { mode: 'local_locked', rules: [] };
+  if (value.mode !== 'local_locked' && value.mode !== 'controlled_cloud') {
+    return { mode: 'local_locked', rules: [] };
+  }
+  const keys = Object.keys(value).sort();
+  if (keys.length !== 2 || keys[0] !== 'mode' || keys[1] !== 'rules') {
+    return { mode: 'local_locked', rules: [] };
+  }
+  if (!Array.isArray(value.rules) || !value.rules.every((rule) => validateEgressRule(rule).length === 0)) {
+    return { mode: 'local_locked', rules: [] };
+  }
+  return {
+    mode: value.mode as EgressConfig['mode'],
+    rules: value.rules.map((rule) => ({ ...rule } as EgressRule)),
+  };
+}
+
 export function loadConfig(): FiscusConfig {
   const path = configPath();
   let cfg: FiscusConfig;
   if (!existsSync(path)) {
     cfg = { ...DEFAULT_CONFIG };
   } else {
+    let raw: unknown;
     try {
-      const raw = JSON.parse(readFileSync(path, 'utf8')) as Partial<FiscusConfig>;
-      cfg = deepMerge(DEFAULT_CONFIG, raw);
-    } catch {
-      // A corrupt config should never take the daemon down. Fall back to defaults.
-      cfg = { ...DEFAULT_CONFIG };
+      raw = JSON.parse(readFileSync(path, 'utf8')) as unknown;
+    } catch (error) {
+      throw new ConfigValidationError(
+        `cannot parse ${path}; repair or restore ${path}.bak before starting Fiscus (${error instanceof Error ? error.message : String(error)})`,
+      );
     }
+    if (!isRecord(raw)) throw new ConfigValidationError(`configuration root in ${path} must be an object`);
+    cfg = deepMerge(DEFAULT_CONFIG, raw as Partial<FiscusConfig>);
+    cfg = { ...cfg, egress: sanitizeEgressConfig(raw.egress) };
   }
+  // Ports cross into URL, server, and copy-paste command construction. Never
+  // interpolate an untrusted JSON value into those surfaces: malformed values
+  // (including shell-like strings) fail closed to the known-good defaults.
+  cfg = {
+    ...cfg,
+    port: sanitizePort(cfg.port, DEFAULT_CONFIG.port),
+    dashboardPort: sanitizePort(cfg.dashboardPort, DEFAULT_CONFIG.dashboardPort),
+  };
+  validateBudgetConfig(cfg.budget);
   return isDemo() ? withDemoDefaults(cfg) : cfg;
 }
 
 export function saveConfig(config: FiscusConfig): void {
   ensureHome();
-  writeFileSync(configPath(), JSON.stringify(config, null, 2) + '\n', 'utf8');
+  validateBudgetConfig(config.budget);
+  const path = configPath();
+  const tempPath = `${path}.tmp-${randomUUID()}`;
+  const backupPath = `${path}.bak`;
+  const text = JSON.stringify(config, null, 2) + '\n';
+  let descriptor: number | null = null;
+  try {
+    // Preserve the previous known-good config before replacing it. The target
+    // itself is replaced by a flushed sibling rename, so readers never observe
+    // a partially written JSON document on filesystems where rename replaces.
+    if (existsSync(path)) copyFileSync(path, backupPath);
+    descriptor = openSync(tempPath, 'wx', 0o600);
+    writeSync(descriptor, text, undefined, 'utf8');
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = null;
+    renameSync(tempPath, path);
+  } catch (error) {
+    if (descriptor !== null) closeSync(descriptor);
+    if (existsSync(tempPath)) unlinkSync(tempPath);
+    throw new ConfigValidationError(`cannot persist ${path}; previous configuration was retained when possible (${error instanceof Error ? error.message : String(error)})`);
+  }
 }

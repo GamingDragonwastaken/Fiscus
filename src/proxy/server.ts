@@ -15,8 +15,10 @@
  *  - Cost headers (X-Fiscus-Cost-USD) are added for non-streaming responses. For
  *    streaming, headers are already flushed before usage is known, so we emit
  *    remaining-budget headers up front and record the final cost server-side.
- *  - Any internal failure falls through to a transparent passthrough: tracking
- *    must never break a developer's session.
+ *  - Ordinary upstream transport failures are returned in a provider-shaped
+ *    upstream-error body, while budget blocks and Fiscus egress-boundary
+ *    refusals use distinct stable types. Corrupt or unextendable receipt
+ *    history refuses the outbound request before DNS/dial.
  */
 
 import http from 'node:http';
@@ -34,6 +36,7 @@ import {
 } from './usage.ts';
 import { extractProposals, type ProposedFile } from '../value/proposals.ts';
 import { StreamProposalAccumulator } from './stream-proposals.ts';
+import { EgressError, egressFetchWithConfig } from '../egress/transport.ts';
 
 const HOP_BY_HOP = new Set([
   'connection',
@@ -152,6 +155,11 @@ function copyDownstreamHeaders(upstream: Response): Record<string, string> {
     const k = key.toLowerCase();
     if (HOP_BY_HOP.has(k)) return;
     if (k === 'content-encoding') return; // we requested identity
+    // Fiscus deliberately does not follow upstream redirects. Forwarding a
+    // Location header would let a client SDK follow one on its own, potentially
+    // sending the prompt/body/credential to a destination outside this process
+    // boundary. Leave the redirect status visible, but remove the escape route.
+    if (k === 'location') return;
     out[key] = value;
   });
   return out;
@@ -201,10 +209,40 @@ function providerErrorBody(provider: Provider, message: string): string {
   return JSON.stringify({ error: { message, type: 'fiscus_budget_block', code: 'budget_exceeded' } });
 }
 
+function providerBudgetUnavailableBody(provider: Provider, message: string): string {
+  if (provider === 'anthropic') {
+    return JSON.stringify({ type: 'error', error: { type: 'fiscus_budget_unavailable', code: 'budget_enforcement_unavailable', message } });
+  }
+  return JSON.stringify({ error: { message, type: 'fiscus_budget_unavailable', code: 'budget_enforcement_unavailable' } });
+}
+
+function providerEgressRefusalBody(provider: Provider, error: EgressError): string {
+  const repair = error.code === 'receipt_integrity_failed' || error.code === 'receipt_persistence_failed'
+    ? ' Repair or restore the local receipt history before retrying.'
+    : '';
+  const message = `Fiscus refused this outbound request at its egress boundary: ${error.message}.${repair}`;
+  if (provider === 'anthropic') {
+    return JSON.stringify({ type: 'error', error: { type: 'fiscus_egress_refusal', code: 'egress_refused', subcode: error.code, message } });
+  }
+  return JSON.stringify({ error: { message, type: 'fiscus_egress_refusal', code: 'egress_refused', subcode: error.code } });
+}
+
+function providerUpstreamErrorBody(provider: Provider, message: string, code: 'upstream_timeout' | 'upstream_unreachable'): string {
+  if (provider === 'anthropic') {
+    return JSON.stringify({ type: 'error', error: { type: 'fiscus_upstream_error', code, message } });
+  }
+  return JSON.stringify({ error: { message, type: 'fiscus_upstream_error', code } });
+}
+
 export interface ProxyDeps {
   store: Store;
   config: FiscusConfig;
   onLog?: (row: RequestRow, decision: GuardDecision) => void;
+}
+
+interface ProxyRuntimeState {
+  /** Set after any local accounting failure; future requests fail closed. */
+  accountingFailure: boolean;
 }
 
 export function createProxyServer(deps: ProxyDeps): http.Server {
@@ -213,9 +251,10 @@ export function createProxyServer(deps: ProxyDeps): http.Server {
   // Resolve budget at each pre-flight check so a newly chosen cap actually
   // governs the already-running proxy, rather than merely looking saved in UI.
   const guard = new BudgetGuard(store, () => config.budget);
+  const state: ProxyRuntimeState = { accountingFailure: false };
 
   const server = http.createServer((req, res) => {
-    handle(req, res, deps, guard).catch((err) => {
+    handle(req, res, deps, guard, state).catch((err) => {
       // Last-resort guard: never leak a 500 that kills the agent session.
       if (!res.headersSent) {
         res.writeHead(502, { 'content-type': 'application/json' });
@@ -234,6 +273,7 @@ async function handle(
   res: http.ServerResponse,
   deps: ProxyDeps,
   guard: BudgetGuard,
+  state: ProxyRuntimeState,
 ): Promise<void> {
   const { store, config } = deps;
   const startedAt = Date.now();
@@ -246,6 +286,18 @@ async function handle(
   }
 
   const route = detectRoute(req, config);
+  if (state.accountingFailure) {
+    const message = 'Fiscus cannot verify local budget/accounting state; the request was not sent. Repair the local ledger or configuration, then restart Fiscus.';
+    res.writeHead(503, {
+      'content-type': 'application/json',
+      'x-fiscus-blocked': '1',
+      'x-fiscus-reason': 'budget_enforcement_unavailable',
+    });
+    res.end(route
+      ? providerBudgetUnavailableBody(route.provider, message)
+      : JSON.stringify({ error: { type: 'fiscus_budget_unavailable', code: 'budget_enforcement_unavailable', message } }));
+    return;
+  }
   const body = await readBody(req);
 
   if (!route) {
@@ -321,12 +373,15 @@ async function handle(
 
   // --- Budget pre-flight ---
   let decision: GuardDecision;
+  let budgetFailure = false;
   try {
     decision = guard.evaluate({ sessionId });
   } catch {
+    budgetFailure = true;
+    state.accountingFailure = true;
     decision = {
-      action: 'allow',
-      reason: null,
+      action: 'block',
+      reason: 'budget_enforcement_unavailable',
       daySpendUsd: 0,
       dailyLimitUsd: null,
       remainingDailyUsd: null,
@@ -337,13 +392,17 @@ async function handle(
   }
 
   if (decision.action === 'block') {
+    const unavailable = budgetFailure;
     const headers: Record<string, string> = {
       'content-type': 'application/json',
       'x-fiscus-blocked': '1',
-      'x-fiscus-reason': sanitizeHeader(decision.reason ?? 'budget'),
+      'x-fiscus-reason': sanitizeHeader(unavailable ? 'budget_enforcement_unavailable' : decision.reason ?? 'budget'),
     };
-    res.writeHead(429, headers);
-    res.end(providerErrorBody(provider, decision.reason ?? 'Budget limit reached.'));
+    res.writeHead(unavailable ? 503 : 429, headers);
+    const message = unavailable
+      ? 'Fiscus cannot verify local budget/accounting state; the request was not sent. Repair the local ledger or configuration, then restart Fiscus.'
+      : decision.reason ?? 'Budget limit reached.';
+    res.end(unavailable ? providerBudgetUnavailableBody(provider, message) : providerErrorBody(provider, message));
     // Log the blocked attempt at zero cost for the audit trail.
     safeLog(deps, {
       requestId: randomUUID(),
@@ -366,10 +425,10 @@ async function handle(
       estimated: false,
       pricing: unpricedPricingEvidence(),
       streamed: parsed.stream,
-      statusCode: 429,
+      statusCode: unavailable ? 503 : 429,
       durationMs: 0,
       ...scopeCapture,
-    }, decision);
+    }, decision, () => { state.accountingFailure = true; });
     return;
   }
 
@@ -387,8 +446,10 @@ async function handle(
   const controller = new AbortController();
   const timeoutTimer = setTimeout(() => controller.abort(), config.upstreamTimeoutMs);
   try {
-    upstream = await fetch(targetUrl, {
-      method: req.method,
+    upstream = await egressFetchWithConfig(config.egress, targetUrl, {
+      purpose: 'provider_inference',
+      dataClass: 'provider_request',
+      method: req.method ?? 'POST',
       headers: buildUpstreamHeaders(req),
       body: req.method === 'GET' || req.method === 'HEAD' ? undefined : outboundBody,
       signal: controller.signal,
@@ -396,17 +457,24 @@ async function handle(
     clearTimeout(timeoutTimer);
   } catch (err) {
     clearTimeout(timeoutTimer);
-    // Either the upstream is unreachable (DNS/refused/network drop) or it never
-    // started responding within upstreamTimeoutMs (we aborted). Fail transparently
-    // with a provider-shaped error the client already handles, and record the
-    // attempt — Fiscus must never be a worse failure mode than calling direct.
+    // Either the upstream is unreachable (DNS/refused/network drop), it never
+    // started responding within upstreamTimeoutMs, or Fiscus refused its own
+    // policy/receipt boundary. Keep these categories distinct: a local
+    // boundary refusal is not a provider budget decision or a remote failure.
     const timedOut = controller.signal.aborted;
-    const status = timedOut ? 504 : 502;
+    const egressRefusal = err instanceof EgressError && err.code !== 'transport_failed' ? err : null;
+    const status = timedOut ? 504 : egressRefusal ? 403 : 502;
     const detail = timedOut
       ? `upstream timed out after ${config.upstreamTimeoutMs}ms (no response headers)`
+      : egressRefusal
+        ? 'Fiscus egress boundary refused this upstream request: ' + egressRefusal.message
       : `upstream unreachable: ${String(err)}`;
-    res.writeHead(status, { 'content-type': 'application/json', 'x-fiscus-upstream-error': '1' });
-    res.end(providerErrorBody(provider, detail));
+    const headers: Record<string, string> = { 'content-type': 'application/json', 'x-fiscus-upstream-error': '1' };
+    if (egressRefusal) headers['x-fiscus-egress-refusal'] = egressRefusal.code;
+    res.writeHead(status, headers);
+    res.end(egressRefusal
+      ? providerEgressRefusalBody(provider, egressRefusal)
+      : providerUpstreamErrorBody(provider, detail, timedOut ? 'upstream_timeout' : 'upstream_unreachable'));
     safeLog(deps, {
       requestId,
       sessionId,
@@ -431,7 +499,7 @@ async function handle(
       statusCode: status,
       durationMs: Date.now() - startedAt,
       ...scopeCapture,
-    }, decision);
+    }, decision, () => { state.accountingFailure = true; });
     return;
   }
 
@@ -530,7 +598,7 @@ async function handle(
     statusCode: upstream.status,
     durationMs: Date.now() - startedAt,
     ...scopeCapture,
-  }, decision);
+  }, decision, () => { state.accountingFailure = true; });
 }
 
 function headerStr(req: http.IncomingMessage, name: string): string | undefined {
@@ -568,11 +636,15 @@ function persistProposals(
   }
 }
 
-function safeLog(deps: ProxyDeps, row: RequestRow, decision: GuardDecision): void {
+function safeLog(deps: ProxyDeps, row: RequestRow, decision: GuardDecision, onFailure?: () => void): boolean {
   try {
     deps.store.insertRequest(row);
     deps.onLog?.(row, decision);
+    return true;
   } catch {
-    // Storage failure must not affect the response that already went out.
+    // The current response may already be out, but future requests must stop
+    // rather than silently continue without a trustworthy accounting record.
+    onFailure?.();
+    return false;
   }
 }

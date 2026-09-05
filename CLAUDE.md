@@ -4,8 +4,10 @@
 
 Local-first **AI Financial Operations** layer: meter AI spend, control it,
 allocate it, reconcile it against provider billing where the evidence allows, and
-measure what it produced. Runs entirely on the operator's machine. Product truth
-is in [PRODUCT.md](PRODUCT.md); read it before designing anything user-facing.
+measure what it produced. The ledger and GUI are local by default; configured
+provider traffic and other declared egress paths are governed by the
+Fiscus-process boundary described in `docs/DATA-BOUNDARIES.md`. Product truth is
+in [PRODUCT.md](PRODUCT.md); read it before designing anything user-facing.
 
 ## The one distinction the whole product is built on
 
@@ -27,12 +29,19 @@ another.** Most defects in this repo have been a version of that collapse.
    result, before the user spends effort or a credential on it.
 4. **Read-only by default.** Compute and preview; `--apply` persists. Preserve
    preview-then-commit as a visible step in any new surface.
-5. **Nothing leaves the machine** without an explicit, informed action. No hidden
-   telemetry, no egress, no credential forwarding. The GUI makes **zero external
-   network requests** — no CDN, no fonts, no analytics.
-6. **Zero runtime dependencies.** `typescript` and `@types/node` are the only
+5. **Budget enforcement fails closed.** Invalid persisted budget/configuration
+   or an unreadable ledger must stop provider forwarding rather than silently
+   becoming an unlimited or unmetered path. Dashboard settings are strict,
+   bounded, and validated before persistence.
+6. **Fiscus's own outbound paths are declared and policy-gated.** There is no
+   hosted telemetry by default; configured provider forwarding, refreshes,
+   webhooks, hosted judging, and team rollups are separate egress paths with
+   explicit scope. The GUI talks to the local dashboard only — no CDN, fonts, or
+   analytics — but this is not a machine-wide firewall or provider-retention
+   guarantee.
+7. **Zero runtime dependencies.** `typescript` and `@types/node` are the only
    devDependencies. Adding a runtime dependency is a decision, not a convenience.
-7. **The repo is public.** Scan for credentials, personal data, and local
+8. **The repo is public.** Scan for credentials, personal data, and local
    filesystem paths before every push.
 
 ## Where the durable state lives
@@ -81,8 +90,9 @@ GUI tests read the emitted `dist/` tree rather than the source. Invoking
 Exercising the CLI should not touch your own ledger:
 
 ```bash
-FISCUS_HOME=/tmp/scratch node bin/fiscus.mjs demo
-FISCUS_HOME=/tmp/scratch node bin/fiscus.mjs start --demo --dashboard-port 8621
+# npm lifecycle hooks rebuild the checked-out dist/ before launch
+FISCUS_HOME=/tmp/scratch npm run demo
+FISCUS_HOME=/tmp/scratch npm run start -- --demo --dashboard-port 8621
 ```
 
 `FISCUS_HOME`, `FISCUS_DB` and `FISCUS_DEMO` are the only overrides — there is

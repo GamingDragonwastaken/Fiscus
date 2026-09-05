@@ -1,9 +1,10 @@
 /**
  * Local persistence — built on Node's bundled SQLite (node:sqlite).
  *
- * No native module, no build step, no external service. The whole point of the
- * product is that nothing leaves the machine, so the store is a single local
- * file under ~/.fiscus.
+ * The store has no native module or external database service dependency. A
+ * packaged distribution still has a build step; this module persists the local
+ * ledger under ~/.fiscus. Provider forwarding and optional outbound paths are
+ * governed by the declared Fiscus-process egress boundary elsewhere.
  *
  * Timestamps are stored twice: an ISO string for humans and an epoch-ms integer
  * for fast range/window queries. Day boundaries are computed in JS (local time)
@@ -12,19 +13,34 @@
 
 import '../util/quiet.ts';
 import { DatabaseSync } from 'node:sqlite';
-import { initializeSchema, runScript } from './schema.ts';
-import { dirname } from 'node:path';
-import { existsSync, mkdirSync } from 'node:fs';
+import { causalV2SchemaAttestation, configureDatabaseConnection, initializeSchema, runScript } from './schema.ts';
+import { dirname, resolve } from 'node:path';
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+} from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
 import { legacyPricingEvidence, type RequestPricingEvidence } from '../cost/pricing.ts';
 import { pricingEvidenceFromRecord } from './rows.ts';
 import type { ProviderScopeDeclaration, ScopeCaptureStatus } from '../billing/scope.ts';
 import { ATTRIBUTION_BASES, type AttributionBasis } from '../value/characterization.ts';
 import type { OpenAiCostsCaptureCoverage } from '../billing/openaiCostsCoverage.ts';
 import type { ReconciliationCoverage, ReconciliationResult, ReconciliationRun } from '../billing/reconcile.ts';
+import type { BillingMappingCoverage, BillingRecordMapping } from '../billing/mapping.ts';
 import type { AllocationRule, CostCentre } from '../alloc/rules.ts';
 import type { AllocationRunResult } from '../alloc/apply.ts';
 import * as allocation from './allocation.ts';
 import * as billing from './billing.ts';
+import * as causal from './causal.ts';
+import * as causalLineage from './causalLineage.ts';
+import * as causalProducer from './causalProducer.ts';
+import * as backup from './backup.ts';
 import * as realization from './realization.ts';
 import type {
   RealizationCostSync,
@@ -42,6 +58,8 @@ export type {
 } from './realization.ts';
 import type {
   BillingEvidenceRecord,
+  BillingRecordMappingDeclarationInput,
+  BillingRecordMappingDeclarationResult,
   BillingImportInput,
   BillingImportResult,
   BillingImportRun,
@@ -52,6 +70,16 @@ import type {
   OpenAiCostsObservationRun,
   OpenAiCostsObservationStatus,
 } from './billing.ts';
+import type {
+  AnyCommittedCausalStudyProtocol,
+  CausalAssignmentManifestV2,
+  CausalAssignmentPlan,
+  CausalAssignmentRequestV2,
+  CausalAssignmentResultV2,
+  CausalExecutionRecord,
+  CausalOutcomeRecord,
+  CommittedCausalStudyProtocol,
+} from '../causal/types.ts';
 
 /**
  * Provider-side evidence shapes now live in ./billing.ts. They are re-exported
@@ -60,6 +88,8 @@ import type {
  */
 export type {
   BillingEvidenceRecord,
+  BillingRecordMappingDeclarationInput,
+  BillingRecordMappingDeclarationResult,
   BillingImportInput,
   BillingImportResult,
   BillingImportRun,
@@ -70,6 +100,32 @@ export type {
   OpenAiCostsObservationRun,
   OpenAiCostsObservationStatus,
 } from './billing.ts';
+export type { BillingMappingCoverage, BillingRecordMapping, ProviderScopeAuthority } from '../billing/mapping.ts';
+export type {
+  AnyCommittedCausalStudyProtocol,
+  CausalAssignmentManifestV2,
+  CausalAssignmentPlan,
+  CausalAssignmentRequestV2,
+  CausalAssignmentResultV2,
+  CausalExecutionRecord,
+  CausalOutcomeRecord,
+  CausalStudyData,
+  CausalStudyEstimate,
+  CommittedCausalStudyProtocol,
+} from '../causal/types.ts';
+export type { CausalAnalysisSnapshot, CausalStudySummary } from './causal.ts';
+export type {
+  CausalLineageBindingLookupV2,
+  CausalLineageBindingValidationV2,
+  CausalLineageBindingV2,
+} from './causalLineage.ts';
+export type {
+  IndependentCausalProducerAssessmentV2,
+  IndependentCausalProducerEvidenceV2,
+  IndependentCausalProducerInputV2,
+  IndependentCausalProducerReasonCodeV2,
+} from './causalProducer.ts';
+export type { BackupInspection, BackupManifest, BackupResult } from './backup.ts';
 
 export interface RequestRow {
   requestId: string;
@@ -268,17 +324,117 @@ function scopeCaptureForInsert(row: RequestRow): { status: ScopeCaptureStatus; d
 
 export class Store {
   private db: DatabaseSync;
+  private readonly databasePath: string;
+  private migrationBackupEvidence: { path: string; sha256: string } | null = null;
 
   constructor(path: string) {
-    if (path !== ':memory:') {
-      const dir = dirname(path);
+    const databasePath = path === ':memory:' ? path : resolve(path);
+    this.databasePath = databasePath;
+    const existingFile = databasePath !== ':memory:' && existsSync(databasePath);
+    if (databasePath !== ':memory:') {
+      const dir = dirname(databasePath);
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     }
-    this.db = new DatabaseSync(path);
-    // node:sqlite's DatabaseSync exposes only prepare() + a multi-statement
-    // runner; we run DDL/PRAGMA as individual prepared statements so the schema
-    // setup stays uniform and side-effect-free.
-    initializeSchema(this.db);
+    this.db = new DatabaseSync(databasePath);
+    let backupPath: string | null = null;
+    let backupVerified = false;
+    try {
+      configureDatabaseConnection(this.db);
+      this.db.prepare('PRAGMA busy_timeout = 5000').run();
+      // node:sqlite's DatabaseSync exposes only prepare() + a multi-statement
+      // runner; we run DDL/PRAGMA as individual prepared statements so the schema
+      // setup stays uniform and side-effect-free. Preflight belongs inside this
+      // guarded boundary because retained SQLite metadata is untrusted input.
+      const causalV2Preflight = causalV2SchemaAttestation(this.db);
+      if (existingFile) {
+        if (causalV2Preflight.state !== 'exact') {
+          backupPath = databasePath + '.pre-causal-v2-' + randomUUID() + '.sqlite';
+          if (existsSync(backupPath)) throw new Error('exclusive causal migration backup path already exists');
+          this.db.prepare('VACUUM INTO ?').run(backupPath);
+          backupPath = realpathSync.native(backupPath);
+          const pathBefore = lstatSync(backupPath);
+          if (!pathBefore.isFile() || pathBefore.isSymbolicLink()) {
+            throw new Error('causal migration backup is not a safe regular sibling file');
+          }
+          const descriptor = openSync(backupPath, 'r');
+          try {
+            const descriptorBefore = fstatSync(descriptor);
+            const verification = new DatabaseSync(backupPath, { readOnly: true });
+            try {
+              configureDatabaseConnection(verification);
+              const quickCheck = verification.prepare('PRAGMA quick_check').get() as { quick_check: string } | undefined;
+              if (quickCheck?.quick_check !== 'ok') throw new Error('backup quick_check did not return ok');
+            } finally {
+              verification.close();
+            }
+            const bytes = readFileSync(descriptor);
+            try {
+              const descriptorAfter = fstatSync(descriptor);
+              const pathAfter = lstatSync(backupPath);
+              const stable = descriptorBefore.dev === descriptorAfter.dev
+                && descriptorBefore.ino === descriptorAfter.ino
+                && descriptorBefore.size === descriptorAfter.size
+                && descriptorBefore.mtimeMs === descriptorAfter.mtimeMs
+                && descriptorBefore.dev === pathAfter.dev
+                && descriptorBefore.ino === pathAfter.ino
+                && descriptorBefore.size === pathAfter.size
+                && descriptorBefore.mtimeMs === pathAfter.mtimeMs
+                && pathAfter.isFile()
+                && !pathAfter.isSymbolicLink();
+              if (!stable) throw new Error('causal migration backup identity changed during verification');
+              this.migrationBackupEvidence = {
+                path: backupPath,
+                sha256: createHash('sha256').update(bytes).digest('hex'),
+              };
+            } finally {
+              // A database backup can contain retained private assignment entropy.
+              // Clear the owned JS copy even when identity verification fails.
+              bytes.fill(0);
+            }
+          } finally {
+            closeSync(descriptor);
+          }
+          backupVerified = true;
+        }
+      }
+      initializeSchema(this.db, {
+        expectedCausalV2State: causalV2Preflight.state,
+        migrationBackupVerified: backupVerified,
+        allowUnbackedCausalV2Create: !existingFile,
+      });
+    } catch {
+      let closeConfirmed = true;
+      try {
+        this.db.close();
+      } catch {
+        closeConfirmed = false;
+      }
+      const closeGuidance = closeConfirmed
+        ? 'The failed Store handle was closed. '
+        : 'The failed Store handle could not be confirmed closed; stop using this database until operator recovery. ';
+      if (backupVerified && backupPath) {
+        throw new Error(
+          'CAUSAL_IO_FAILURE: causal v2 migration failed before an operational Store opened; ' +
+          'the retained database was not accepted. The verified backup remains readable at ' + backupPath + '. ' +
+          closeGuidance + 'Inspect the retained database and verified backup before recovery.',
+        );
+      }
+      if (existingFile) {
+        const candidateGuidance = backupPath
+          ? 'No verified backup was produced; an unverified backup candidate may exist at ' + backupPath + '. '
+          : 'No verified backup was produced. ';
+        throw new Error(
+          'CAUSAL_IO_FAILURE: causal v2 schema initialization failed before an operational Store opened; ' +
+          'the retained database was not accepted. ' + candidateGuidance + closeGuidance +
+          'Inspect the retained database before recovery.',
+        );
+      }
+      throw new Error(
+        'CAUSAL_IO_FAILURE: causal v2 schema initialization failed before an operational Store opened; ' +
+        'no retained database migration was performed. ' + closeGuidance +
+        'Inspect the database path before retrying.',
+      );
+    }
   }
 
   /** Transaction control and one-off DDL — see runScript in schema.ts. */
@@ -308,6 +464,26 @@ export class Store {
 
   raw(): DatabaseSync {
     return this.db;
+  }
+
+  /** Create a verified, non-destructive snapshot of this Store's ledger. */
+  backupTo(destinationPath: string): backup.BackupResult {
+    return backup.backupDatabase(this.db, this.databasePath, destinationPath);
+  }
+
+  /** Inspect a backup without opening or mutating the active Store. */
+  static inspectBackup(databasePath: string): backup.BackupResult {
+    return backup.inspectBackup(databasePath);
+  }
+
+  /** Restore a verified backup into a new path; never overwrites an active DB. */
+  static restoreBackup(sourcePath: string, destinationPath: string): backup.BackupResult {
+    return backup.restoreDatabase(sourcePath, destinationPath);
+  }
+
+  /** Evidence for the backup created immediately before this open migrated v2 tables. */
+  causalMigrationBackupEvidence(): { path: string; sha256: string } | null {
+    return this.migrationBackupEvidence ? { ...this.migrationBackupEvidence } : null;
   }
 
   /**
@@ -1380,6 +1556,30 @@ export class Store {
     return billing.billingEvidenceRecords(this.db);
   }
 
+  /** Every immutable operator-declared mapping version, oldest first per record. */
+  billingRecordMappings(recordId?: string): BillingRecordMapping[] {
+    return billing.billingRecordMappings(this.db, recordId);
+  }
+
+  /**
+   * Append an exact imported-record mapping to a local project/account. A
+   * repeated identical declaration is idempotent; a changed destination creates
+   * a new version and leaves the prior decision intact.
+   */
+  declareBillingRecordMapping(input: BillingRecordMappingDeclarationInput): BillingRecordMappingDeclarationResult {
+    return billing.declareBillingRecordMapping(this.db, input);
+  }
+
+  /**
+   * Report mapped coverage and residual reasons without changing provider or
+   * request evidence. The Store facade intentionally cannot assert
+   * provider_verified; that authority must arrive from a future verified
+   * connector boundary rather than an operator flag.
+   */
+  billingMappingCoverage(options: { importId?: string; asOfMs?: number } = {}): BillingMappingCoverage {
+    return billing.billingMappingCoverage(this.db, options);
+  }
+
   /** Provider-declared USD total only. It is not a reconciliation or a request-ledger total. */
   billingSummary(): BillingSummary {
     return billing.billingSummary(this.db);
@@ -1563,6 +1763,107 @@ export class Store {
   /** Snapshot only when a request's resolved OpenAI endpoint exactly matches the active declaration. */
   matchingOpenAiScope(upstreamBase: string): ProviderScopeDeclaration | null {
     return billing.matchingOpenAiScope(this.db, upstreamBase);
+  }
+
+  /**
+   * Commit a validated causal-study protocol. Existing committed records are
+   * idempotent only when byte-for-byte equivalent; no update path exists.
+   */
+  registerCausalProtocol(protocol: unknown): 'created' | 'existing' {
+    return causal.registerCausalProtocol(this.db, protocol);
+  }
+
+  /** Persist a complete pre-exposure randomisation block and its decision ledger. */
+  saveCausalAssignmentPlan(plan: CausalAssignmentPlan): 'created' | 'existing' {
+    return causal.saveCausalAssignmentPlan(this.db, plan);
+  }
+
+  /**
+   * Atomically allocate and persist one v2 block. Sequence and cryptographic
+   * entropy are Store-owned and allocations are returned only after commit.
+   */
+  assignCausalBlockV2(request: CausalAssignmentRequestV2): CausalAssignmentResultV2 {
+    return causal.assignCausalBlockV2(this.db, request);
+  }
+
+  causalAssignmentManifestV2(studyId: string): CausalAssignmentManifestV2 | null {
+    return causal.causalAssignmentManifestV2(this.db, studyId);
+  }
+
+  /** Append actual execution lineage after a stored randomized decision. */
+  appendCausalExecution(record: CausalExecutionRecord): 'created' | 'existing' {
+    return causal.appendCausalExecution(this.db, record);
+  }
+
+  /** Store-internal v2 execution append; terminal outcomes are a later slice. */
+  appendCausalExecutionV2(record: unknown): 'created' | 'existing' {
+    return causal.appendCausalExecutionV2(this.db, record);
+  }
+
+  /** Store-internal v2 terminal outcome append; pending is represented by absence. */
+  appendCausalTerminalOutcomeV2(record: unknown): 'created' | 'existing' {
+    return causal.appendCausalTerminalOutcomeV2(this.db, record);
+  }
+
+  /** Store-internal T-069 scalar request-to-realization sidecar append. */
+  appendCausalLineageBindingV2(record: unknown): 'created' | 'existing' {
+    return causalLineage.appendCausalLineageBindingV2(this.db, record);
+  }
+
+  /** Prepare a Store-authenticated, independently-derived scalar unit binding. */
+  prepareIndependentCausalLineageBindingV2(
+    input: causalProducer.IndependentCausalProducerInputV2,
+  ): causalProducer.IndependentCausalProducerAssessmentV2 {
+    return causalProducer.prepareIndependentCausalLineageBindingV2(this.db, input);
+  }
+
+  /** Atomically retain the derived realization identity and append its binding. */
+  appendIndependentCausalLineageBindingV2(
+    input: causalProducer.IndependentCausalProducerInputV2,
+  ): causalProducer.IndependentCausalProducerAssessmentV2 {
+    return causalProducer.appendIndependentCausalLineageBindingV2(this.db, input);
+  }
+
+  /** Read only authenticated T-069 sidecar rows; prompts/source are absent. */
+  causalLineageBindingsV2(
+    studyId: string,
+    lookup: causalLineage.CausalLineageBindingLookupV2 = {},
+  ): causalLineage.CausalLineageBindingV2[] {
+    return causalLineage.causalLineageBindingsV2(this.db, studyId, lookup);
+  }
+
+  /** Append outcome lineage after a stored execution. */
+  appendCausalOutcome(record: CausalOutcomeRecord): 'created' | 'existing' {
+    return causal.appendCausalOutcome(this.db, record);
+  }
+
+  /** Load the local evidence objects required for deterministic qualification. */
+  causalStudyData(studyId: string): import('../causal/types.ts').CausalStudyData | null {
+    return causal.causalStudyData(this.db, studyId);
+  }
+
+  causalAssignmentPlans(studyId: string): CausalAssignmentPlan[] {
+    return causal.causalAssignmentPlans(this.db, studyId);
+  }
+
+  /**
+   * Persist one immutable local analysis snapshot. It never changes provider
+   * routing or budget configuration.
+   */
+  saveCausalAnalysis(
+    studyId: string,
+    analysisId: string,
+    computedAtMs = Date.now(),
+  ): causal.CausalAnalysisSnapshot {
+    return causal.saveCausalAnalysis(this.db, studyId, analysisId, computedAtMs);
+  }
+
+  causalAnalysisSnapshots(studyId: string): causal.CausalAnalysisSnapshot[] {
+    return causal.causalAnalysisSnapshots(this.db, studyId);
+  }
+
+  causalStudySummaries(): causal.CausalStudySummary[] {
+    return causal.causalStudySummaries(this.db);
   }
 
   /** Maintenance: prune old requests and compact. Returns rows removed. */

@@ -20,7 +20,7 @@ import { computeFrontier } from '../value/frontier.ts';
 import { valueSpine, usageValue, budgetAdvice } from '../value/report.ts';
 import { instrumentationPriority } from '../value/voi.ts';
 import { GATE_LADDER, GATE_META } from '../value/gates.ts';
-import { C, color, usd, num, pct, glyph, noteSource, printNotAGitRepo } from './ui.ts';
+import { C, color, usd, num, pct, glyph, noteSource, printNotAGitRepo, printJson } from './ui.ts';
 import { type Flags } from './flags.ts';
 
 export async function cmdYield(flags: Flags): Promise<void> {
@@ -36,7 +36,7 @@ export async function cmdYield(flags: Flags): Promise<void> {
   const report = await computeQuality(store, repo, { limit, windowDays, persist: true });
 
   if (flags.json) {
-    process.stdout.write(JSON.stringify(report, null, 2) + '\n');
+    printJson(report);
     store.close();
     return;
   }
@@ -102,7 +102,7 @@ export async function cmdRealize(flags: Flags): Promise<void> {
   const report = loaded.report;
 
   if (flags.json) {
-    process.stdout.write(JSON.stringify(report, null, 2) + '\n');
+    printJson(report);
     store.close();
     return;
   }
@@ -255,7 +255,7 @@ export async function cmdUsage(flags: Flags): Promise<void> {
   const rep = usageValue(store, cfg, { windowDays: days });
 
   if (flags.json) {
-    process.stdout.write(JSON.stringify(rep, null, 2) + '\n');
+    printJson(rep);
     store.close();
     return;
   }
@@ -283,8 +283,7 @@ export async function cmdUsage(flags: Flags): Promise<void> {
   // The money face — only when the org disclosed outcome baselines + a rate.
   const rr = rep.roi.returnRatio;
   if (rep.money.priced && rr.basis === 'usd' && rr.grossRatio !== null) {
-    const head = rr.causalRatio ?? rr.grossRatio;
-    console.log(`  RoI return          ${color(tty, head >= 1 ? C.green : C.red, head.toFixed(2) + '×')}   ${color(tty, C.gray, `${head >= 1 ? 'pays for itself' : 'below break-even'} — outcomes priced by your disclosed baselines${isDemo() ? ' (demo: illustrative baselines)' : ''}`)}`);
+    console.log(`  Value scenario       ${color(tty, C.yellow, rr.grossRatio.toFixed(2) + '×')}   ${color(tty, C.gray, 'observed/manual-equivalent, not a causal return' + (isDemo() ? ' (demo: illustrative baselines)' : ''))}`);
   } else if (rep.realizedUnits > 0) {
     console.log(color(tty, C.gray, '                      dollar return un-priced — set lift.outcomeBaselineMinutes + laborRatePerHour to price outcomes'));
   }
@@ -347,7 +346,7 @@ export async function cmdRoi(flags: Flags): Promise<void> {
   const { roi, drift, driftStreams, voi } = spine;
 
   if (flags.json) {
-    process.stdout.write(JSON.stringify({ ...roi, drift, driftStreams, instrumentNext: voi }, null, 2) + '\n');
+    printJson({ ...roi, drift, driftStreams, instrumentNext: voi });
     store.close();
     return;
   }
@@ -364,23 +363,23 @@ export async function cmdRoi(flags: Flags): Promise<void> {
   const hasBand = iv.low !== null && iv.high !== null && idx !== null && (iv.high - iv.low) > 0.5;
   const band = hasBand ? color(tty, C.gray, `  [${iv.low!.toFixed(0)}–${iv.high!.toFixed(0)}]`) : '';
   console.log(`  ${color(tty, C.bold, 'RoI Index')}           ${idx === null ? color(tty, C.gray, 'n/a (no lenses instrumented)') : color(tty, idx > 60 ? C.green : idx > 30 ? C.yellow : C.red, `${idx.toFixed(0)} / 100`)}${band}   ${color(tty, C.gray, hasBand ? 'point in a partially-identified interval' : 'geometric mean — no axis can carry it alone')}`);
-  if (roi.indexIsUpperBound && idx !== null) {
-    console.log(color(tty, C.gray, `  ${''.padEnd(20)}↑ upper bound — wiring more lenses can only lower it toward the truth`));
+  if (idx !== null && roi.coverage < 1) {
+    const observed = roi.instrumentationInterval.observed;
+    const low = roi.instrumentationInterval.low;
+    const high = roi.instrumentationInterval.high;
+    const sensitivity = observed !== null && low !== null && high !== null
+      ? `full-lens sensitivity ${low.toFixed(0)}–${high.toFixed(0)}`
+      : 'full-lens sensitivity not established';
+    console.log(color(tty, C.gray, `  ${''.padEnd(20)}${Math.round(roi.coverage * 4)}/4 lenses measured · ${sensitivity} — a measured lens may move the observed score up or down`));
   }
   const eff = roi.realizedEfficiency;
   console.log(`  Realized efficiency  ${eff === null ? '—' : color(tty, C.green, pct(eff))}   ${color(tty, C.gray, `of $${(roi.tokenCostUsd + roi.effortTaxUsd).toFixed(2)} spent (tokens${roi.effortTaxUsd > 0 ? ' + effort' : ''})`)}`);
 
-  // The money number — value ÷ cost, ≥1 ⟺ it paid for itself.
+  // The money number is an observed/manual-equivalent scenario until a separate
+  // qualified randomized study supplies an economic estimand.
   const rr = roi.returnRatio;
   if (rr.basis === 'usd' && rr.grossRatio !== null) {
-    const headline = rr.causalRatio ?? rr.grossRatio;
-    const col = headline >= 1 ? C.green : C.red;
-    const band =
-      rr.causalRange.low !== null && rr.causalRange.high !== null
-        ? color(tty, C.gray, ` [${rr.causalRange.low.toFixed(2)}–${rr.causalRange.high.toFixed(2)}×]`)
-        : '';
-    const tail = (headline >= 1 ? 'pays for itself' : 'below break-even') + (rr.causalRatio === null ? ' (gross — wire Lift to credit the counterfactual)' : '');
-    console.log(`  ${color(tty, C.bold, 'RoI return')}           ${color(tty, col, headline.toFixed(2) + '×')}${band}   ${color(tty, C.gray, tail)}`);
+    console.log(`  ${color(tty, C.bold, 'Value scenario')}       ${color(tty, C.yellow, rr.grossRatio.toFixed(2) + '×')}   ${color(tty, C.gray, 'observed/manual-equivalent; causal study required for break-even')}`);
     console.log(color(tty, C.gray, `  ${''.padEnd(20)}$${(rr.realizedValueUsd ?? 0).toFixed(0)} realized work (manual-equiv, net of rework) ÷ $${rr.costUsd.toFixed(2)} cost (tokens + your time)`));
   } else if (rr.realizedValueUsd !== null && !rr.supervisionPriced) {
     console.log(`  ${color(tty, C.bold, 'RoI return')}           ${color(tty, C.gray, 'un-priced — wire proxy traffic so your time-with-AI can be measured')}`);
@@ -433,7 +432,7 @@ export async function cmdRoi(flags: Flags): Promise<void> {
         color(
           tty,
           C.gray,
-          `largest unmeasured exposure: measured at a mid ${top.reference}, the Index moves ${roi.roiIndex.toFixed(0)} → ${top.indexAtReference.toFixed(0)} — measuring only makes the number more honest`,
+          `largest unmeasured exposure: at a mid ${top.reference}, the observed Index moves ${roi.roiIndex.toFixed(0)} → ${top.indexAtReference.toFixed(0)} — direction is disclosed sensitivity, not a monotone promise`,
         ),
     );
   }
@@ -472,7 +471,7 @@ export async function cmdSaved(flags: Flags): Promise<void> {
   const rec = spine.reclaimed;
 
   if (flags.json) {
-    process.stdout.write(JSON.stringify(rec, null, 2) + '\n');
+    printJson(rec);
     store.close();
     return;
   }
@@ -536,7 +535,7 @@ export async function cmdBudgetAdvisor(flags: Flags): Promise<void> {
   const allocation = null;
 
   if (flags.json) {
-    process.stdout.write(JSON.stringify({ ...rec, allocation, shadowPrice: null }, null, 2) + '\n');
+    printJson({ ...rec, allocation, shadowPrice: null });
     store.close();
     return;
   }
@@ -626,7 +625,7 @@ export async function cmdFrontier(flags: Flags): Promise<void> {
   const fr = computeFrontier(report.units);
 
   if (flags.json) {
-    process.stdout.write(JSON.stringify(fr, null, 2) + '\n');
+    printJson(fr);
     store.close();
     return;
   }

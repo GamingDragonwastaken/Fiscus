@@ -21,6 +21,9 @@ whole tree loaded.
 | A CLI verb | `src/cli/` | `src/cli.ts` (dispatch) |
 | Team rollups | `src/team/`, `team-server/` | `docs/TEAM-TIER-DESIGN.md` |
 | Releasing | `docs/RELEASE-GATE.md` | `CLAUDE.md` |
+| Backup/restore and recovery | `src/store/backup.ts` | `src/store/CONTEXT.md`, `docs/RELEASE-GATE.md` |
+| Reliability/performance evidence | `scripts/benchmark.mjs` | `docs/RELIABILITY-PERFORMANCE.md` |
+| Local diagnostics and redacted support bundles | `src/diagnostics.ts` | `docs/RELIABILITY-PERFORMANCE.md`, `docs/RELEASE-GATE.md` |
 
 ## Layer 3 — reference (stable; internalize as constraints)
 
@@ -30,12 +33,18 @@ Read these as rules, not as input. They change rarely and they bind everything.
 |---|---|
 | `CLAUDE.md` | The hard rules. Non-negotiable. |
 | `PRODUCT.md` | Product truth: users, purpose, capabilities, principles. |
+| `docs/CAPABILITY-EVIDENCE-CONTRACT.md` | Current capability/evidence status and permitted product claims. |
 | `docs/DATA-BOUNDARIES.md` | What may leave the machine, and under what action. |
 | `docs/EVIDENCE-PROVENANCE.md` | What each provenance label means and may claim. |
 | `docs/METHODOLOGY.md` | How measurements are computed and what they do not prove. |
 | `docs/THE-STANDARD.md` | The claim standard the product holds itself to. |
 | `docs/ARCHITECTURE.md` | How the pieces fit. |
 | `docs/DESIGN-DIRECTION.md` | The GUI's visual and interaction system. |
+
+Runtime/source and an exact revision-bound release gate decide shipped
+behaviour. PRODUCT.md is the vision and requirement source; the capability
+contract is the current claim source; the roadmap is direction; vision audits
+and dated release-gate rows are historical evidence at their named revision.
 
 ## Layer 4 — working artifacts (change constantly; process as input)
 
