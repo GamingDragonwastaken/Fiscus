@@ -10,6 +10,13 @@
   operator-supplied export adopted from an import (`Store.adoptOpenAiCostsFromImport`).
 - Exact imported-record mapping (`mapping.ts`) can attach a provider line to a
   local project/account, but only as an operator declaration.
+- `epistemic.ts` issues the first vertical's provider-line Evidence and billed
+  Claims through exact `Money`, and can issue a mixed-basis reconciliation Claim
+  when both provider and local-capture evidence IDs are supplied. Complete
+  direct OpenAI Costs snapshots issue separate provider-observed Evidence and
+  Claims; they never become billed merely because the endpoint is authoritative.
+  A recorded reconciliation can persist the provider, local-capture and mixed
+  residual Claims as one resumable kernel issuance; CLI `--apply` uses that path.
 
 ## Guarantees
 
@@ -27,6 +34,10 @@
 - Mapping coverage is explicit: each imported line is `mapped_operator_declared`,
   `unmapped`, `stale_mapping`, or `ambiguous_mapping`; residual dollars remain
   visible and are never force-fitted.
+- Kernel issuance keeps provider billed amounts and local estimated amounts as
+  separate Money bases; a residual is a typed comparison, never a new basis or
+  an attributable cause. Repeating issuance is idempotent through the kernel
+  ledger.
 
 ## Invariants
 
@@ -50,4 +61,5 @@
 
 ```bash
 npm test -- --test-name-pattern="reconcile|adopt|coverage|scope"
+node --test --experimental-strip-types test/billing-epistemic.test.ts
 ```

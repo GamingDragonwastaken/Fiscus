@@ -16,7 +16,12 @@ import {
   verifyDeterministicCausalAssignmentV2 as verifyBlockedAssignmentPlanV2,
 } from './support/causalDeterministicRng.ts';
 import { createRetainedCausalV1AssignmentFixture } from './support/causalV1Fixture.ts';
+import { completedData, modelDraft, repeatedCostQualityData } from './support/causalStudyFixture.ts';
 import { estimateCausalStudy } from '../src/causal/estimate.ts';
+import {
+  getEstimandDefinition,
+  RANDOMIZED_ITT_ESTIMAND_ID,
+} from '../src/causal/estimand.ts';
 import {
   canonicalJson,
   causalEventHash,
@@ -37,6 +42,7 @@ import {
   type CausalDecisionRecordV2,
   type CausalExecutionRecordV2,
   type CausalTerminalOutcomeRecordV2,
+  type CausalDecisionRecord,
   type CommittedCausalStudyProtocolV2,
   type CausalExecutionRecord,
   type CausalOutcomeRecord,
@@ -47,26 +53,6 @@ import {
 
 const H = (char: string): string => char.repeat(64);
 
-function modelDraft(overrides: Partial<CausalStudyProtocolDraft> = {}): CausalStudyProtocolDraft {
-  return {
-    type: CAUSAL_PROTOCOL_TYPE,
-    version: CAUSAL_PROTOCOL_VERSION,
-    studyId: 'study-model',
-    createdAtMs: 1_700_000_000_000,
-    question: 'model_cost_quality',
-    eligibility: { cohortId: 'cohort-a', unitOfAssignment: 'task', contextSchemaId: 'task-v1' },
-    arms: [
-      { armId: 'candidate', role: 'candidate', executionPlanHash: H('a'), providerId: 'provider-a', modelId: 'model-new' },
-      { armId: 'control', role: 'control', executionPlanHash: H('b'), providerId: 'provider-a', modelId: 'model-old' },
-    ],
-    allocation: { method: 'blocked_randomized_equal_allocation', probabilityPerArm: 0.5, blockSize: 4 },
-    costOutcome: { metricId: 'direct_cost_usd', boundsUsd: { low: 0, high: 100 }, acceptedSourceClasses: ['actual_observed'] },
-    qualityOutcome: { metricId: 'verified_quality', bounds: { low: 0, high: 1 }, evidenceClass: 'deterministic', nonInferiorityMargin: 0.05 },
-    economicOutcome: null,
-    analysis: { estimand: 'intention_to_treat', confidenceLevel: 0.95, minCompletedPerArm: 2, maxMissingFractionPerArm: 0.25 },
-    ...overrides,
-  };
-}
 
 const D = (char: string): string => 'sha256:' + H(char);
 
@@ -168,9 +154,6 @@ function aiV2Draft(overrides: Partial<CausalStudyProtocolDraftV2> = {}): CausalS
   });
 }
 
-function event<T extends Record<string, unknown>>(input: T): T & { eventHash: string } {
-  return { ...input, eventHash: causalEventHash(input) };
-}
 
 const V2_ASSIGNMENT_ENTROPY = Buffer.from(
   '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f',
@@ -205,55 +188,6 @@ function v2DecisionEventHashForTamper(decision: CausalDecisionRecordV2): string 
     .digest('hex');
 }
 
-function completedData(): CausalStudyData {
-  const protocol = commitCausalProtocol(modelDraft(), 1_700_000_000_100);
-  const plan = createRetainedCausalV1AssignmentFixture(protocol, {
-    blockId: 'block-1',
-    createdAtMs: 1_700_000_000_200,
-    unitIdHashes: [H('1'), H('2'), H('3'), H('4')],
-    randomizationMaterial: Buffer.from('0123456789abcdef0123456789abcdef', 'hex'),
-  });
-  const executions: CausalExecutionRecord[] = [];
-  const outcomes: CausalOutcomeRecord[] = [];
-  for (const decision of plan.decisions) {
-    const arm = protocol.arms.find((candidate) => candidate.armId === decision.assignedArmId)!;
-    const execution = event({
-      executionId: 'exec:' + decision.decisionId,
-      decisionId: decision.decisionId,
-      studyId: protocol.studyId,
-      protocolHash: protocol.protocolHash,
-      startedAtMs: decision.assignedAtMs + 1,
-      completedAtMs: decision.assignedAtMs + 2,
-      assignedExecutionPlanHash: arm.executionPlanHash,
-      actualExecutionPlanHash: arm.executionPlanHash,
-      adherence: 'confirmed' as const,
-      requestIds: ['request:' + decision.decisionId],
-      directAiCostUsd: decision.assignedArmId === 'candidate' ? 5 : 12,
-      directCostSourceClass: 'actual_observed' as const,
-      priceLineageHashes: [H('c')],
-      fullArmCostUsd: null,
-      fullCostSourceClass: 'incomplete_or_unknown' as const,
-      previousEventHash: decision.eventHash,
-    });
-    executions.push(execution);
-    outcomes.push(event({
-      outcomeId: 'outcome:' + decision.decisionId,
-      decisionId: decision.decisionId,
-      studyId: protocol.studyId,
-      protocolHash: protocol.protocolHash,
-      observedAtMs: execution.completedAtMs + 1,
-      maturity: 'matured' as const,
-      qualityValue: 0.9,
-      qualityEvidenceClass: 'deterministic' as const,
-      economicValueUsd: null,
-      economicEvidenceClass: null,
-      outcomeEvidenceRefs: ['evidence:' + decision.decisionId],
-      missingReason: null,
-      previousEventHash: execution.eventHash,
-    }));
-  }
-  return { protocol, decisions: plan.decisions, executions, outcomes };
-}
 
 test('causal protocol commits a deterministic structural hash and rejects raw/free-text identifiers', () => {
   const draft = modelDraft();
@@ -294,6 +228,28 @@ test('v2 protocol validates, commits its frozen domain-separated hash, and rejec
   const nestedExtra = structuredClone(v2Draft()) as CausalStudyProtocolDraftV2;
   (nestedExtra.analysis as unknown as Record<string, unknown>).postHocWinner = true;
   assert.ok(validateCausalProtocol(nestedExtra).some((error) => /analysis has unsupported field: postHocWinner/i.test(error)));
+});
+
+test('v2 explicit joint rule is committed and cannot be altered after registration', () => {
+  const draft = v2Draft({
+    analysis: {
+      ...v2Draft().analysis,
+      jointInference: {
+        method: 'bonferroni',
+        endpointFamily: 'cost_quality',
+        endpointCount: 2,
+        alphaAllocation: 'equal',
+        nonInferiorityMargin: 0.05,
+        costSuperiorityThresholdUsd: 0,
+        secondaryEndpointPolicy: 'none',
+      },
+    },
+  });
+  assert.deepEqual(validateCausalProtocol(draft), []);
+  const committed = commitCausalProtocol(draft, 1_700_000_000_600);
+  const tampered = structuredClone(committed) as unknown as Record<string, unknown>;
+  ((tampered.analysis as Record<string, unknown>).jointInference as Record<string, unknown>).alphaAllocation = 'unequal';
+  assert.ok(verifyCommittedCausalProtocol(tampered).some((error) => /hash|alpha|joint/i.test(error)));
 });
 
 test('policy-bearing V2 protocol accepts the exact bounded follow-up root field and hashes it', () => {
@@ -820,6 +776,150 @@ test('complete randomized evidence qualifies as a study but interval gates still
   assert.equal(estimate.qualification.state, 'qualified');
   assert.equal(estimate.allowedClaim, 'not_established', 'four units cannot earn a low-cost claim from a wide predeclared range');
   assert.equal(estimate.qualityNonInferiorityPassed, false, 'the conservative interval also governs quality language');
+});
+
+test('causal study estimates carry the registered estimand id and exact definition', () => {
+  const estimate = estimateCausalStudy(completedData());
+  assert.equal(estimate.estimandId, RANDOMIZED_ITT_ESTIMAND_ID);
+  assert.strictEqual(estimate.estimandDefinition, getEstimandDefinition(RANDOMIZED_ITT_ESTIMAND_ID));
+  assert.equal(estimate.estimandDefinition?.analysis, 'intention_to_treat');
+});
+
+test('an unsupported runtime estimand is marked unknown rather than assigned a made-up registry id', () => {
+  const data = completedData();
+  const unsupported = structuredClone(data) as CausalStudyData;
+  (unsupported.protocol.analysis as unknown as Record<string, unknown>).estimand = 'per_protocol';
+
+  const estimate = estimateCausalStudy(unsupported);
+
+  assert.equal(estimate.qualification.state, 'invalid');
+  assert.equal(estimate.estimandId, null);
+  assert.equal(estimate.estimandDefinition, null);
+  assert.match(estimate.limitations.join(' '), /estimand.*registered|registered.*estimand/i);
+});
+
+test('a non-v1 protocol shape cannot inherit the v1 estimand identity', () => {
+  const data = completedData();
+  const unsupported = structuredClone(data) as CausalStudyData;
+  (unsupported.protocol as unknown as Record<string, unknown>).version = 2;
+
+  const estimate = estimateCausalStudy(unsupported);
+
+  assert.equal(estimate.qualification.state, 'invalid');
+  assert.equal(estimate.estimandId, null);
+  assert.equal(estimate.estimandDefinition, null);
+});
+
+test('joint causal inference reports an immutable Bonferroni rule and endpoint confidence', () => {
+  const draft = modelDraft() as unknown as Record<string, unknown>;
+  const analysis = draft.analysis as Record<string, unknown>;
+  analysis.jointInference = {
+    method: 'bonferroni',
+    endpointFamily: 'cost_quality',
+    endpointCount: 2,
+    alphaAllocation: 'equal',
+    nonInferiorityMargin: 0.05,
+    costSuperiorityThresholdUsd: 0,
+    secondaryEndpointPolicy: 'none',
+  };
+  assert.deepEqual(validateCausalProtocol(draft), [], 'the joint rule is part of the pre-registered protocol shape');
+  const committed = commitCausalProtocol(draft);
+  const tampered = structuredClone(committed) as unknown as Record<string, unknown>;
+  ((tampered.analysis as Record<string, unknown>).jointInference as Record<string, unknown>).endpointCount = 1;
+  assert.ok(verifyCommittedCausalProtocol(tampered).some((error) => /hash|endpoint|joint/i.test(error)));
+
+  const estimate = estimateCausalStudy(completedData(draft as unknown as CausalStudyProtocolDraft));
+  assert.equal(estimate.jointInference.method, 'bonferroni');
+  assert.equal(estimate.jointInference.endpointFamily, 'cost_quality');
+  assert.equal(estimate.jointInference.endpointCount, 2);
+  assert.equal(estimate.jointInference.alphaAllocation, 'equal');
+  assert.equal(estimate.jointInference.nonInferiorityMargin, 0.05);
+  assert.equal(estimate.jointInference.costSuperiorityThresholdUsd, 0);
+  assert.equal(estimate.jointInference.secondaryEndpointPolicy, 'none');
+  assert.equal(estimate.jointInference.overallConfidenceLevel, 0.95);
+  assert.equal(estimate.jointInference.endpointConfidenceLevel, 0.975);
+  assert.equal(estimate.jointInference.ruleSource, 'protocol');
+});
+
+test('joint cost-quality claim cannot borrow two independent full-alpha intervals', () => {
+  const data = repeatedCostQualityData(0.545, 0.455);
+  const qualification = qualifyCausalStudy(data);
+  assert.equal(qualification.state, 'qualified', qualification.reasons.slice(0, 5).join('; '));
+  const estimate = estimateCausalStudy(data);
+  assert.equal(estimate.lowerCostPassed, true, 'the large cohort establishes cost superiority under either conservative level');
+  assert.equal(estimate.qualityNonInferiorityPassed, false, 'the joint endpoint level must govern the conjunction');
+  assert.equal(estimate.allowedClaim, 'not_established');
+
+  // At the nominal 95% endpoint level this quality lower bound would clear the
+  // 0.05 margin; the pre-registered two-endpoint Bonferroni level correctly
+  // widens it enough to withhold the joint claim.
+  const alpha = 1 - 0.95;
+  const width = 1;
+  const independentRadius = width * Math.sqrt(Math.log(4 / alpha) / (2 * 500)) * 2;
+  const independentLower = 0.17 - independentRadius;
+  assert.ok(independentLower > -0.05, `independent lower bound should clear the margin: ${independentLower}`);
+  assert.ok(estimate.qualityEffect !== null && estimate.qualityEffect.lower <= -0.05);
+});
+
+test('joint cost-quality claim requires both endpoints even when quality alone passes', () => {
+  const data = repeatedCostQualityData(0.9, 0.1, 49, 51);
+  const qualification = qualifyCausalStudy(data);
+  assert.equal(qualification.state, 'qualified', qualification.reasons.slice(0, 5).join('; '));
+  const estimate = estimateCausalStudy(data);
+  assert.equal(estimate.qualityNonInferiorityPassed, true, 'quality can pass on its own');
+  assert.equal(estimate.lowerCostPassed, false, 'cost still fails');
+  assert.equal(estimate.allowedClaim, 'not_established', 'the conjunction cannot pass when one endpoint fails');
+});
+
+test('joint quality boundary exactly at the registered margin is withheld', () => {
+  const alpha = 1 - 0.975;
+  const radius = 2 * Math.sqrt(Math.log(4 / alpha) / (2 * 500));
+  const qualityControl = 0.4;
+  const qualityCandidate = qualityControl - 0.05 + radius;
+  const data = repeatedCostQualityData(qualityCandidate, qualityControl, 1, 99);
+  const estimate = estimateCausalStudy(data);
+  assert.ok(estimate.qualityEffect !== null);
+  assert.ok(Math.abs(estimate.qualityEffect.lower + 0.05) < 1e-12, `lower=${estimate.qualityEffect.lower}`);
+  assert.equal(estimate.qualityNonInferiorityPassed, false, 'strictly above the margin is required');
+  assert.equal(estimate.allowedClaim, 'not_established');
+});
+
+test('joint bounded-outcome rule stays conservative in a deterministic null simulation', () => {
+  const nextRandom = (seed: number) => {
+    let state = seed >>> 0;
+    return () => {
+      state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+      return state / 0x1_0000_0000;
+    };
+  };
+
+  const simulate = (seed: number): number => {
+    const random = nextRandom(seed);
+    let falseConjunctions = 0;
+    for (let simulation = 0; simulation < 24; simulation += 1) {
+      const data = repeatedCostQualityData(0.5, 0.5, 50, 50);
+      const executionByDecision = new Map(data.executions.map((execution) => [execution.decisionId, execution]));
+      for (const execution of data.executions) {
+        const core = { ...execution, directAiCostUsd: random() * 100, eventHash: undefined };
+        execution.directAiCostUsd = core.directAiCostUsd;
+        execution.eventHash = causalEventHash(core);
+      }
+      for (const outcome of data.outcomes) {
+        const execution = executionByDecision.get(outcome.decisionId)!;
+        const core = { ...outcome, qualityValue: random(), previousEventHash: execution.eventHash, eventHash: undefined };
+        outcome.qualityValue = core.qualityValue;
+        outcome.previousEventHash = core.previousEventHash;
+        outcome.eventHash = causalEventHash(core);
+      }
+      const estimate = estimateCausalStudy(data);
+      if (estimate.allowedClaim === 'comparative_cost_quality_supported') falseConjunctions += 1;
+    }
+    return falseConjunctions;
+  };
+
+  const first = simulate(0xA061);
+  assert.equal(first, simulate(0xA061), 'the calibration fixture must be reproducible');
+  assert.ok(first <= 2, `the 95% family-wise rule should not produce repeated null conjunctions: ${first}/24`);
 });
 
 test('plan deviation, pending outcome, and modeled cost each invalidate or withhold causal evidence', () => {

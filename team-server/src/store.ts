@@ -11,7 +11,7 @@
 
 import pg from 'pg';
 const { Pool } = pg;
-import type { SignedRollup, RollupBody } from '../../src/team/rollup.ts';
+import { combineRollupCoverage, normalizeRollupCoverage, type RollupCoverage, type SignedRollup, type RollupBody } from '../../src/team/rollup.ts';
 
 export interface RegisteredDeveloper {
   keyId: string;
@@ -56,18 +56,38 @@ export interface PeriodFilter {
  * comment for why naive averaging would silently redefine what these numbers
  * mean relative to the single-machine dashboard.
  */
+/**
+ * One distinct observation window among the rollups that fed an aggregate.
+ *
+ * WHY THIS EXISTS SEPARATELY FROM THE TOTALS. A rollup's window is chosen by
+ * whoever pushed it — `fiscus team push --window D` defaults to 30 and takes
+ * anything — so the snapshots summed into one team total need not cover the
+ * same period at all. The server already refuses to filter a snapshot by a
+ * partial window, on the stated grounds that it "would present its whole total
+ * as though it belonged to that partial window", and then summed windows that
+ * disagree with each other into a figure that named no period. This is the
+ * evidence a reader needs to see that the sum is not one period. Recorded at
+ * D-102.
+ */
+export interface ObservationWindow {
+  periodFrom: string;
+  periodTo: string;
+  developerCount: number;
+  coverage: RollupCoverage;
+}
+
 export interface ProjectTotals {
   project: string;
   developerCount: number;
   rollupCount: number;
   totalUnits: number;
   totalCostUsd: number;
-  totalRealizedValueUsd: number;
-  totalNetRealizedValueUsd: number;
+  totalSpendOnRealizedUnitsUsd: number;
+  totalAcceptanceWeightedSpendUsd: number;
   /** Denominator-weighted across rollups: SUM(realizedUnits)/SUM(units) — same "unit-count" metric as ProjectValue.realizationRate, not a dollar ratio. Null when totalUnits is 0. */
   realizationRate: number | null;
-  /** Dollar-weighted: totalRealizedValueUsd/totalCostUsd. Null when totalCostUsd is 0. */
-  realizedValueRate: number | null;
+  /** Dollar-weighted: totalSpendOnRealizedUnitsUsd/totalCostUsd. Null when totalCostUsd is 0. */
+  realizedSpendShare: number | null;
   /** Cost-weighted average RoI Index over rows that have one. Null when no contributing row has a roiIndex. */
   avgRoiIndex: number | null;
 }
@@ -78,8 +98,8 @@ export interface DeveloperTotals {
   label: string | null;
   rollupCount: number;
   totalCostUsd: number;
-  totalRealizedValueUsd: number;
-  realizedValueRate: number | null;
+  totalSpendOnRealizedUnitsUsd: number;
+  realizedSpendShare: number | null;
   lastPushedAt: string;
 }
 
@@ -90,6 +110,8 @@ export interface RollupStore {
   listRollups(opts?: { keyId?: string; limit?: number }): Promise<StoredRollup[]>;
   aggregateProjects(filter?: PeriodFilter): Promise<ProjectTotals[]>;
   aggregateDevelopers(filter?: PeriodFilter): Promise<DeveloperTotals[]>;
+  /** The distinct windows of the rollups that `aggregateProjects` would sum. */
+  observationWindows(filter?: PeriodFilter): Promise<ObservationWindow[]>;
   close(): Promise<void>;
 }
 
@@ -121,10 +143,10 @@ interface ProjectTotalsRow {
   rollup_count: number;
   total_units: number;
   total_cost_usd: number;
-  total_realized_value_usd: number;
-  total_net_realized_value_usd: number;
+  total_spend_on_realized_units_usd: number;
+  total_acceptance_weighted_spend_usd: number;
   realization_rate: number | null;
-  realized_value_rate: number | null;
+  realized_spend_share: number | null;
   avg_roi_index: number | null;
 }
 
@@ -133,8 +155,8 @@ interface DeveloperTotalsRow {
   label: string | null;
   rollup_count: number;
   total_cost_usd: number;
-  total_realized_value_usd: number;
-  realized_value_rate: number | null;
+  total_spend_on_realized_units_usd: number;
+  realized_spend_share: number | null;
   last_pushed_at: Date;
 }
 
@@ -210,9 +232,9 @@ export class PgRollupStore implements RollupStore {
       for (const p of signed.body.projects) {
         await client.query(
           `INSERT INTO rollup_projects
-             (rollup_id, project, units, cost_usd, realization_rate, realized_value_usd, net_realized_value_usd, roi_index, sources)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-          [inserted.id, p.project, p.units, p.costUsd, p.realizationRate, p.realizedValueUsd, p.netRealizedValueUsd, p.roiIndex, JSON.stringify(p.sources)],
+             (rollup_id, project, units, cost_usd, realization_rate, spend_on_realized_units_usd, acceptance_weighted_spend_usd, roi_index, sources, economic_json)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [inserted.id, p.project, p.units, p.costUsd, p.realizationRate, p.spendOnRealizedUnitsUsd, p.acceptanceWeightedSpendUsd, p.roiIndex, JSON.stringify(p.sources), p.economic === undefined ? null : JSON.stringify(p.economic)],
         );
       }
       await client.query('COMMIT');
@@ -261,6 +283,51 @@ export class PgRollupStore implements RollupStore {
    * every aggregate to float8 sidesteps that uniformly; realistic rollup/unit
    * counts are nowhere near double's exact-integer range (2^53).
    */
+  /**
+   * The same `latest_rollup_per_dev` population the aggregates use, grouped by
+   * the window each of those rollups declared. Deliberately a separate query
+   * rather than another column on the totals: the totals are per project and a
+   * window is per developer, so folding one into the other would either
+   * duplicate windows per project row or silently pick one of them.
+   */
+  async observationWindows(filter: PeriodFilter = {}): Promise<ObservationWindow[]> {
+    const res = await this.pool.query<{
+      period_from: Date;
+      period_to: Date;
+      developer_count: string | number;
+      coverages: string[];
+    }>(
+      `WITH latest_rollup_per_dev AS (
+         SELECT DISTINCT ON (r.key_id) r.id, r.key_id, r.period_from, r.period_to,
+                COALESCE(r.body->>'coverage', 'unknown') AS coverage
+         FROM rollups r
+         WHERE ($1::timestamptz IS NULL OR r.period_to > $1::timestamptz)
+           AND ($2::timestamptz IS NULL OR r.period_from < $2::timestamptz)
+         ORDER BY r.key_id, r.received_at DESC, r.id DESC
+       )
+       SELECT lr.period_from AS period_from, lr.period_to AS period_to,
+              COUNT(DISTINCT lr.key_id)::float8 AS developer_count,
+              ARRAY_AGG(DISTINCT lr.coverage) AS coverages
+       FROM latest_rollup_per_dev lr
+       GROUP BY lr.period_from, lr.period_to
+       ORDER BY lr.period_from ASC, lr.period_to ASC`,
+      [filter.periodFrom ?? null, filter.periodTo ?? null],
+    );
+    return res.rows.map((row) => ({
+      periodFrom: row.period_from.toISOString(),
+      periodTo: row.period_to.toISOString(),
+      developerCount: Number(row.developer_count),
+      coverage: combineRollupCoverage(row.coverages.map((value) => normalizeRollupCoverage({
+        v: 1,
+        keyId: 'coverage-only',
+        generatedAt: '1970-01-01T00:00:00.000Z',
+        period: { from: '1970-01-01T00:00:00.000Z', to: '1970-01-02T00:00:00.000Z' },
+        projects: [],
+        coverage: value as RollupCoverage,
+      }))),
+    }));
+  }
+
   async aggregateProjects(filter: PeriodFilter = {}): Promise<ProjectTotals[]> {
     const res = await this.pool.query<ProjectTotalsRow>(
       `WITH latest_rollup_per_dev AS (
@@ -276,10 +343,10 @@ export class PgRollupStore implements RollupStore {
          COUNT(DISTINCT r.id)::float8 AS rollup_count,
          COALESCE(SUM(rp.units), 0)::float8 AS total_units,
          COALESCE(SUM(rp.cost_usd), 0)::float8 AS total_cost_usd,
-         COALESCE(SUM(rp.realized_value_usd), 0)::float8 AS total_realized_value_usd,
-         COALESCE(SUM(rp.net_realized_value_usd), 0)::float8 AS total_net_realized_value_usd,
+         COALESCE(SUM(rp.spend_on_realized_units_usd), 0)::float8 AS total_spend_on_realized_units_usd,
+         COALESCE(SUM(rp.acceptance_weighted_spend_usd), 0)::float8 AS total_acceptance_weighted_spend_usd,
          (SUM(rp.realization_rate * rp.units) / NULLIF(SUM(rp.units), 0))::float8 AS realization_rate,
-         (SUM(rp.realized_value_usd) / NULLIF(SUM(rp.cost_usd), 0))::float8 AS realized_value_rate,
+         (SUM(rp.spend_on_realized_units_usd) / NULLIF(SUM(rp.cost_usd), 0))::float8 AS realized_spend_share,
          (SUM(CASE WHEN rp.roi_index IS NOT NULL THEN rp.roi_index * rp.cost_usd ELSE 0 END)
             / NULLIF(SUM(CASE WHEN rp.roi_index IS NOT NULL THEN rp.cost_usd ELSE 0 END), 0))::float8 AS avg_roi_index
        FROM rollup_projects rp
@@ -295,10 +362,10 @@ export class PgRollupStore implements RollupStore {
       rollupCount: row.rollup_count,
       totalUnits: row.total_units,
       totalCostUsd: row.total_cost_usd,
-      totalRealizedValueUsd: row.total_realized_value_usd,
-      totalNetRealizedValueUsd: row.total_net_realized_value_usd,
+      totalSpendOnRealizedUnitsUsd: row.total_spend_on_realized_units_usd,
+      totalAcceptanceWeightedSpendUsd: row.total_acceptance_weighted_spend_usd,
       realizationRate: row.realization_rate,
-      realizedValueRate: row.realized_value_rate,
+      realizedSpendShare: row.realized_spend_share,
       avgRoiIndex: row.avg_roi_index,
     }));
   }
@@ -317,8 +384,8 @@ export class PgRollupStore implements RollupStore {
          d.label AS label,
          COUNT(DISTINCT lr.id)::float8 AS rollup_count,
          COALESCE(SUM(rp.cost_usd), 0)::float8 AS total_cost_usd,
-         COALESCE(SUM(rp.realized_value_usd), 0)::float8 AS total_realized_value_usd,
-         (SUM(rp.realized_value_usd) / NULLIF(SUM(rp.cost_usd), 0))::float8 AS realized_value_rate,
+         COALESCE(SUM(rp.spend_on_realized_units_usd), 0)::float8 AS total_spend_on_realized_units_usd,
+         (SUM(rp.spend_on_realized_units_usd) / NULLIF(SUM(rp.cost_usd), 0))::float8 AS realized_spend_share,
          MAX(lr.received_at) AS last_pushed_at
        FROM developers d
        JOIN latest_rollup_per_dev lr ON lr.key_id = d.key_id
@@ -332,8 +399,8 @@ export class PgRollupStore implements RollupStore {
       label: row.label,
       rollupCount: row.rollup_count,
       totalCostUsd: row.total_cost_usd,
-      totalRealizedValueUsd: row.total_realized_value_usd,
-      realizedValueRate: row.realized_value_rate,
+      totalSpendOnRealizedUnitsUsd: row.total_spend_on_realized_units_usd,
+      realizedSpendShare: row.realized_spend_share,
       lastPushedAt: row.last_pushed_at.toISOString(),
     }));
   }

@@ -6,6 +6,8 @@
 
 - `src/store/db.ts` (read, and write on the mutating routes), `src/config.ts`.
 - The value, billing, alloc and cost modules for computed payloads.
+- `src/dashboard/shared-types.ts` for the canonical no-runtime payload declarations;
+  the build emits a hash-bound browser copy under `web/app/core/generated-types.ts`.
 - Nothing from the network. Not at build time, not at run time.
 
 ## Layout
@@ -26,7 +28,8 @@ web/
       signal.ts      reactive primitive (~80 lines, no framework)
       dom.ts         h() / render(); no HTML-parsing sink anywhere
       fmt.ts         money, dates, and the plain/precise REGISTER
-      api.ts         typed client for this server
+      api.ts         typed client for this server; consumes generated-types.ts
+      generated-types.ts  generated browser copy of shared-types.ts; never edit
       claimTypes.ts  Layer + ClaimInspection: the shape of a claim's evidence
       claimLayers.ts the four claims, DERIVED from payloads. Pure; tested.
       chain.ts       the I/O half: four independent reads, each degrading alone
@@ -99,7 +102,8 @@ web/
 - **A CLI/GUI parity claim is a shared function, never a comment.** Where a
   route answers the same question as a CLI verb, both call one module:
   `/api/value` and the value commands compose `src/value/report.ts`;
-  `/api/pricing` and `pricing --coverage` compose `src/cost/coverage.ts`. This
+  `/api/pricing` and `pricing --coverage` compose `src/cost/coverage.ts`;
+  `/api/economic` and `economic --json` compose `src/cli/economicCmd.ts`. This
   repo has already paid for the alternative — five comments in the dashboard
   asserting its arithmetic matched the CLI's, which is asserting, not enforcing.
   A new route that restates a CLI computation inline is the defect.
@@ -156,7 +160,35 @@ web/
   and a phantom `reconciliation.latest` the Evidence view read forever. A field
   that is on the wire and undeclared is the same defect facing the other way —
   it forces a cast. Presence-checking contract tests do not cover this; the
-  shape does, against a record that actually exists.
+  shape and runtime primitive/array/record/interface/null-union types, against
+  records that actually exist. It is still a conformance gate, not a generated
+  single-source schema; the release gate keeps that distinction explicit.
+- **Exact economic data has a read-only route and a typed client contract.**
+  `GET/HEAD /api/economic` serves the CLI's canonical report with exact Money
+  strings, source/effective request coverage, role-aware balances and bounded
+  time-window validation. Its `periodClose` field carries the canonical
+  half-open period's append-only finalization/reopen/conflict state and exact
+  projection digest; the route remains read-only and never mutates close
+  controls. It does not rewrite legacy value payloads or invent provider/billed
+  authority; a dedicated dashboard view remains a downstream consumer
+  migration rather than a second accounting implementation.
+- **Route, envelope and named payload types are shared and fail closed.** The no-node
+  dashboard contract drives API paths, methods, Allow headers, CSRF gates,
+  response bindings and browser-surface bindings; the build copies it into the
+  browser under the publication lock. Its top-level JSON/text payload contracts
+  are validated by seeded conformance and by the modern client before a typed
+  response is returned. The named payload interfaces now have one canonical
+  no-runtime source in `shared-types.ts`; the build generates both the browser
+  declaration copy and nested runtime metadata with the exact source hash under
+  the same publication lock. The realization route now has a named nested gate,
+  maturity, waste and exact-economic report contract; text/CSV and any future
+  payloads that are not yet named remain explicit boundaries, as do full
+  docs/claim/egress generation.
+- **Capability parity is an immutable contract.** `CAPABILITY_SPECS` augments
+  every GUI registry entry with input/preview/output schema classes, authority,
+  egress, credentials, reversibility, assurance and CLI/API/GUI/docs bindings.
+  Planned, read-only and destructive consequences are checked conservatively;
+  the System view renders the specs rather than a second capability list.
 - **Overlays mount once, on `body`, outside the shell's render root.** The shell
   effect re-runs on every register change and `render(root, …)` clears `#app`.
   Mounting inside it appended a fresh host and a never-disposed effect per

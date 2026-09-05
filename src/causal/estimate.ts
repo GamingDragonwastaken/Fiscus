@@ -1,4 +1,12 @@
 /**
+ * ISSUANCE CLASS: kernel_primitive — see `src/epistemic/issuance-map.ts`.
+ * Depends on `qualification.ts` and inherits its position. The estimator
+ * pre-declares its bounds and does not adapt; `src/causal/epistemic.ts` carries
+ * the interval and the joint decision rule onto an issued Claim, so revoking the
+ * study evidence invalidates what was derived from it. This file still decides
+ * whether an effect is supported — issuance refuses to mint a causal claim it
+ * did not already authorise, and adds revocability rather than strength.
+ *
  * Conservative, transparent estimators for the initial randomized-study lane.
  *
  * The first version deliberately avoids adaptive modelling and p-value badges.
@@ -7,10 +15,13 @@
  */
 
 import { qualifyCausalStudy } from './qualification.ts';
+import { resolveEstimandDefinition } from './estimand.ts';
+import { verifyCommittedCausalProtocol } from './protocol.ts';
 import type {
   CausalEffectInterval,
   CausalStudyData,
   CausalStudyEstimate,
+  CausalJointInferenceResult,
   NumericBounds,
 } from './types.ts';
 
@@ -50,6 +61,42 @@ function standardLimitations(): string[] {
   ];
 }
 
+function jointInferenceRule(data: CausalStudyData): CausalJointInferenceResult {
+  const declared = data.protocol.analysis.jointInference;
+  const defaultFamily = data.protocol.question === 'model_cost_quality' ? 'cost_quality' : 'net_benefit';
+  const defaultCount = defaultFamily === 'cost_quality' ? 2 : 1;
+  const declaredMargin = data.protocol.qualityOutcome?.nonInferiorityMargin;
+  const defaultMargin = Number.isFinite(declaredMargin) && declaredMargin >= 0 ? declaredMargin : 0;
+  const declaredIsValid = declared !== undefined
+    && declared.method === 'bonferroni'
+    && declared.endpointFamily === defaultFamily
+    && declared.endpointCount === defaultCount
+    && declared.alphaAllocation === 'equal'
+    && Number.isFinite(declared.nonInferiorityMargin)
+    && declared.nonInferiorityMargin === defaultMargin
+    && Number.isFinite(declared.costSuperiorityThresholdUsd)
+    && declared.costSuperiorityThresholdUsd >= 0
+    && (declared.secondaryEndpointPolicy === 'none' || declared.secondaryEndpointPolicy === 'descriptive_only');
+  const endpointFamily = declaredIsValid ? declared.endpointFamily : defaultFamily;
+  const endpointCount = declaredIsValid ? declared.endpointCount : defaultCount;
+  const rawConfidence = data.protocol.analysis.confidenceLevel;
+  const overallConfidenceLevel = Number.isFinite(rawConfidence) && rawConfidence > 0 && rawConfidence < 1 ? rawConfidence : 0.95;
+  const endpointAlpha = (1 - overallConfidenceLevel) / endpointCount;
+  return Object.freeze({
+    method: 'bonferroni',
+    endpointFamily,
+    endpointCount,
+    alphaAllocation: 'equal',
+    nonInferiorityMargin: declaredIsValid ? declared.nonInferiorityMargin : defaultMargin,
+    costSuperiorityThresholdUsd: declaredIsValid ? declared.costSuperiorityThresholdUsd : 0,
+    secondaryEndpointPolicy: declaredIsValid ? declared.secondaryEndpointPolicy : 'none',
+    overallConfidenceLevel,
+    endpointConfidenceLevel: 1 - endpointAlpha,
+    endpointAlpha,
+    ruleSource: declaredIsValid ? 'protocol' : 'version_default',
+  });
+}
+
 /**
  * Estimate only after all structural qualification gates have passed. A
  * randomized design can be valid yet inconclusive: interval evidence must pass
@@ -57,17 +104,31 @@ function standardLimitations(): string[] {
  */
 export function estimateCausalStudy(data: CausalStudyData): CausalStudyEstimate {
   const qualification = qualifyCausalStudy(data);
+  const jointInference = jointInferenceRule(data);
+  const estimandDefinition = data.protocol.version === 1
+    && verifyCommittedCausalProtocol(data.protocol).length === 0
+    ? resolveEstimandDefinition((data.protocol.analysis as unknown as { estimand?: unknown }).estimand) ?? null
+    : null;
   const noEstimate: CausalStudyEstimate = {
     qualification,
     protocolHash: data.protocol.protocolHash,
+    estimandId: estimandDefinition?.id ?? null,
+    estimandDefinition,
     costEffectUsd: null,
     qualityEffect: null,
     netBenefitEffectUsd: null,
     qualityNonInferiorityPassed: null,
     lowerCostPassed: null,
     causalNetBenefitSupported: null,
+    jointInference,
     allowedClaim: 'not_established',
-    limitations: standardLimitations(),
+    limitations: [
+      ...standardLimitations(),
+      ...(estimandDefinition === null
+        ? ['The protocol does not name a registered causal estimand; no estimand identity is inferred.']
+        : []),
+      `${jointInference.method} joint rule: ${(jointInference.overallConfidenceLevel * 100).toFixed(2)}% overall confidence allocated equally across ${jointInference.endpointCount} ${jointInference.endpointFamily} endpoint(s) at ${(jointInference.endpointConfidenceLevel * 100).toFixed(2)}% each; quality non-inferiority margin ${jointInference.nonInferiorityMargin}; cost superiority threshold $${jointInference.costSuperiorityThresholdUsd.toFixed(6)}; secondary endpoints ${jointInference.secondaryEndpointPolicy}${jointInference.ruleSource === 'version_default' ? ' (legacy protocol version default)' : ' (pre-registered in the protocol)'}.`,
+    ],
   };
   if (qualification.state !== 'qualified') return noEstimate;
 
@@ -115,16 +176,16 @@ export function estimateCausalStudy(data: CausalStudyData): CausalStudyEstimate 
     treatmentCost,
     controlCost,
     protocol.costOutcome.boundsUsd,
-    protocol.analysis.confidenceLevel,
+    jointInference.endpointConfidenceLevel,
   );
   const qualityEffect = boundedDifference(
     treatmentQuality,
     controlQuality,
     protocol.qualityOutcome.bounds,
-    protocol.analysis.confidenceLevel,
+    jointInference.endpointConfidenceLevel,
   );
-  const qualityNonInferiorityPassed = qualityEffect.lower > -protocol.qualityOutcome.nonInferiorityMargin;
-  const lowerCostPassed = costEffectUsd.upper < 0;
+  const qualityNonInferiorityPassed = qualityEffect.lower > -jointInference.nonInferiorityMargin;
+  const lowerCostPassed = costEffectUsd.upper < -jointInference.costSuperiorityThresholdUsd;
 
   if (protocol.question === 'model_cost_quality') {
     return {
@@ -150,7 +211,7 @@ export function estimateCausalStudy(data: CausalStudyData): CausalStudyEstimate 
     treatmentNetBenefit,
     controlNetBenefit,
     netBounds,
-    protocol.analysis.confidenceLevel,
+    jointInference.endpointConfidenceLevel,
   );
   const causalNetBenefitSupported = netBenefitEffectUsd.lower > 0;
   return {

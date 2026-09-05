@@ -12,8 +12,11 @@ whole tree loaded.
 | Metering a request, proxy behaviour | `src/proxy/` | `src/cost/`, `src/store/CONTEXT.md` |
 | Where a row's project label came from | `src/store/CONTEXT.md` | `docs/EVIDENCE-PROVENANCE.md` |
 | Prices, rate cards, repricing | `src/cost/` | `pricing/`, `docs/METHODOLOGY.md` |
+| Exact Money, economic events, conservation projections | `src/economics/` | `src/store/CONTEXT.md`, `docs/program/FISCUS-REMAINING-WORK-AUDIT.md` |
 | Budgets, caps, alerts | `src/budget/`, `src/alerts/` | — |
 | Importing tool logs | `src/connect/`, `src/cli/importCmd.ts` | `docs/INTEGRATIONS.md` |
+| Robust decisions, regret, and VoI | `src/decision/` | `docs/ECONOMIC-CONTROL-FOUNDATION.md`, `docs/program/FISCUS-REMAINING-WORK-AUDIT.md` |
+| Epistemic state, derivation, and revocation | `src/epistemic/` | `docs/THE-STANDARD.md`, `docs/program/FISCUS-REMAINING-WORK-AUDIT.md` |
 | Provider billing, reconciliation | `src/billing/CONTEXT.md` | `docs/PROVIDER-RECONCILIATION.md` |
 | Cost centres, allocation rules | `src/alloc/CONTEXT.md` | `docs/ALLOCATION.md` |
 | RoI, realized value, model trials | `src/value/CONTEXT.md` | `docs/RETURN-ON-INTELLIGENCE.md`, `docs/METHODOLOGY.md` |

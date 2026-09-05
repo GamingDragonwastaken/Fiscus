@@ -8,6 +8,20 @@
 
 import type { DatabaseSync } from 'node:sqlite';
 
+/** On-disk schema generation understood by this build. */
+export const CURRENT_SCHEMA_VERSION = 1;
+
+/** Read and validate SQLite's monotonic application schema version. */
+export function readSchemaVersion(db: DatabaseSync): number {
+  const row = db.prepare('PRAGMA user_version').get() as { user_version?: unknown } | undefined;
+  if (typeof row?.user_version !== 'number'
+      || !Number.isSafeInteger(row.user_version)
+      || row.user_version < 0) {
+    throw new Error('schema version is invalid');
+  }
+  return row.user_version;
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT PRIMARY KEY NOT NULL,
@@ -49,7 +63,8 @@ CREATE TABLE IF NOT EXISTS requests (
   rate_match_model  TEXT,
   scope_capture_status TEXT NOT NULL DEFAULT 'legacy_unknown',
   provider_scope_declaration_id TEXT,
-  attribution_basis TEXT NOT NULL DEFAULT 'legacy_unknown'
+  attribution_basis TEXT NOT NULL DEFAULT 'legacy_unknown',
+  capture_coverage TEXT NOT NULL DEFAULT 'legacy_unknown'
 );
 
 CREATE INDEX IF NOT EXISTS idx_requests_ts      ON requests(ts_epoch_ms);
@@ -129,7 +144,8 @@ CREATE TABLE IF NOT EXISTS proposals (
   provider    TEXT NOT NULL,
   model       TEXT NOT NULL,
   project     TEXT NOT NULL DEFAULT 'default',
-  files_json  TEXT NOT NULL
+  files_json  TEXT NOT NULL,
+  capture_coverage TEXT NOT NULL DEFAULT 'legacy_unknown'
 );
 
 CREATE INDEX IF NOT EXISTS idx_proposals_ts      ON proposals(ts_epoch_ms);
@@ -618,6 +634,162 @@ CREATE TABLE IF NOT EXISTS causal_clock_state (
 `;
 
 /**
+ * Trusted Epistemic Kernel persistence. Keeping these definitions beside the
+ * operational schema preserves the repository's one-writer DDL rule; the
+ * ledger domain only issues DML against these tables.
+ */
+const EPISTEMIC_SCHEMA = `
+CREATE TABLE IF NOT EXISTS epistemic_nodes (
+  node_id TEXT PRIMARY KEY,
+  node_kind TEXT NOT NULL,
+  available_at TEXT NOT NULL,
+  epistemic TEXT NOT NULL,
+  supersedes_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_epistemic_nodes_available ON epistemic_nodes(available_at, node_id);
+
+CREATE TABLE IF NOT EXISTS epistemic_evidence (
+  evidence_id TEXT PRIMARY KEY,
+  evidence_json TEXT NOT NULL,
+  evidence_digest TEXT NOT NULL,
+  FOREIGN KEY (evidence_id) REFERENCES epistemic_nodes(node_id)
+);
+
+CREATE TABLE IF NOT EXISTS epistemic_claims (
+  claim_id TEXT PRIMARY KEY,
+  claim_json TEXT NOT NULL,
+  claim_digest TEXT NOT NULL,
+  FOREIGN KEY (claim_id) REFERENCES epistemic_nodes(node_id)
+);
+
+CREATE TABLE IF NOT EXISTS epistemic_assumptions (
+  assumption_id TEXT PRIMARY KEY,
+  assumption_json TEXT NOT NULL,
+  assumption_digest TEXT NOT NULL,
+  FOREIGN KEY (assumption_id) REFERENCES epistemic_nodes(node_id)
+);
+
+CREATE TABLE IF NOT EXISTS epistemic_witnesses (
+  witness_id TEXT PRIMARY KEY,
+  witness_json TEXT NOT NULL,
+  witness_digest TEXT NOT NULL,
+  FOREIGN KEY (witness_id) REFERENCES epistemic_nodes(node_id)
+);
+
+CREATE TABLE IF NOT EXISTS epistemic_derivations (
+  derivation_id TEXT PRIMARY KEY,
+  derivation_json TEXT NOT NULL,
+  derivation_digest TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS epistemic_edges (
+  from_id TEXT NOT NULL,
+  to_id TEXT NOT NULL,
+  relation TEXT NOT NULL,
+  PRIMARY KEY (from_id, to_id, relation),
+  FOREIGN KEY (from_id) REFERENCES epistemic_nodes(node_id),
+  FOREIGN KEY (to_id) REFERENCES epistemic_nodes(node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_epistemic_edges_from ON epistemic_edges(from_id, to_id, relation);
+CREATE INDEX IF NOT EXISTS idx_epistemic_edges_to ON epistemic_edges(to_id, from_id, relation);
+
+CREATE TABLE IF NOT EXISTS epistemic_revocations (
+  event_id TEXT PRIMARY KEY,
+  target_id TEXT NOT NULL,
+  recorded_at TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  FOREIGN KEY (target_id) REFERENCES epistemic_nodes(node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_epistemic_revocations_target ON epistemic_revocations(target_id, event_id);
+`;
+
+/** Immutable exact-Money economic event subledger. */
+const ECONOMIC_SCHEMA = `
+CREATE TABLE IF NOT EXISTS economic_events (
+  event_id TEXT PRIMARY KEY,
+  event_kind TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  recorded_at TEXT NOT NULL,
+  event_json TEXT NOT NULL,
+  event_digest TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS economic_event_sources (
+  event_id        TEXT NOT NULL,
+  source_event_id TEXT NOT NULL,
+  PRIMARY KEY (event_id, source_event_id),
+  FOREIGN KEY (event_id) REFERENCES economic_events(event_id),
+  FOREIGN KEY (source_event_id) REFERENCES economic_events(event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_economic_events_recorded ON economic_events(recorded_at, event_id);
+CREATE INDEX IF NOT EXISTS idx_economic_events_subject ON economic_events(subject, recorded_at, event_id);
+CREATE INDEX IF NOT EXISTS idx_economic_events_occurred ON economic_events(occurred_at, event_id);
+CREATE INDEX IF NOT EXISTS idx_economic_event_sources_source ON economic_event_sources(source_event_id, event_id);
+
+-- Historical FX knowledge is evidence, not mutable configuration. The
+-- canonical observation and digest are retained together, while recorded_at and the
+-- explicit predecessor edge are queryable side columns whose values are
+-- revalidated against the canonical JSON at every read boundary.
+CREATE TABLE IF NOT EXISTS economic_fx_rate_observations (
+  observation_id     TEXT PRIMARY KEY NOT NULL,
+  recorded_at        TEXT NOT NULL,
+  supersedes_id      TEXT,
+  observation_json   TEXT NOT NULL,
+  observation_digest TEXT NOT NULL,
+  FOREIGN KEY (supersedes_id) REFERENCES economic_fx_rate_observations(observation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_economic_fx_rate_observations_recorded
+  ON economic_fx_rate_observations(recorded_at, observation_id);
+
+CREATE TABLE IF NOT EXISTS economic_allocation_runs (
+  allocation_run_id TEXT PRIMARY KEY NOT NULL,
+  period_start_ms INTEGER NOT NULL,
+  period_end_ms INTEGER NOT NULL,
+  run_at_ms INTEGER NOT NULL,
+  computed_at_ms INTEGER NOT NULL,
+  complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
+  conserves INTEGER NOT NULL CHECK (conserves IN (0, 1)),
+  result_json TEXT NOT NULL,
+  result_digest TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS economic_allocation_lineage (
+  allocation_run_id TEXT NOT NULL,
+  item_kind TEXT NOT NULL CHECK (item_kind IN ('line', 'unallocated')),
+  item_index INTEGER NOT NULL CHECK (item_index >= 0),
+  source_event_id TEXT NOT NULL,
+  PRIMARY KEY (allocation_run_id, item_kind, item_index, source_event_id),
+  FOREIGN KEY (allocation_run_id) REFERENCES economic_allocation_runs(allocation_run_id),
+  FOREIGN KEY (source_event_id) REFERENCES economic_events(event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_economic_allocation_lineage_source ON economic_allocation_lineage(source_event_id, allocation_run_id);
+
+-- A close authorization is separate from the canonical allocation result so
+-- the result digest remains compatible while new runs carry an immutable,
+-- explicitly validated period-close witness. Older runs without this row are
+-- intentionally unreadable rather than backfilled by inference.
+CREATE TABLE IF NOT EXISTS economic_allocation_close_bindings (
+  allocation_run_id  TEXT PRIMARY KEY NOT NULL,
+  period_start_ms    INTEGER NOT NULL,
+  period_end_ms      INTEGER NOT NULL,
+  finalization_id    TEXT NOT NULL,
+  projection_digest  TEXT NOT NULL,
+  event_count        INTEGER NOT NULL CHECK (event_count >= 0),
+  FOREIGN KEY (allocation_run_id) REFERENCES economic_allocation_runs(allocation_run_id),
+  FOREIGN KEY (finalization_id) REFERENCES economic_events(event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_economic_allocation_close_finalization ON economic_allocation_close_bindings(finalization_id);
+`;
+
+/**
  * Configure connection-local SQLite behavior before any schema inspection or
  * causal write.  INSERT OR REPLACE implements conflict resolution by deleting
  * the conflicting row first; SQLite only runs that delete through the normal
@@ -625,6 +797,192 @@ CREATE TABLE IF NOT EXISTS causal_clock_state (
  */
 export function configureDatabaseConnection(db: DatabaseSync): void {
   db.prepare('PRAGMA recursive_triggers = ON').run();
+  db.prepare('PRAGMA foreign_keys = ON').run();
+  db.prepare('PRAGMA busy_timeout = 5000').run();
+}
+
+export interface DatabasePragmaState {
+  foreignKeys: number;
+  recursiveTriggers: number;
+  busyTimeout: number;
+  journalMode: string;
+  synchronous: number;
+}
+
+/** Read the connection settings that govern SQLite durability and enforcement. */
+export function databasePragmas(db: DatabaseSync): DatabasePragmaState {
+  const foreignKeys = db.prepare('PRAGMA foreign_keys').get() as { foreign_keys?: unknown } | undefined;
+  const recursiveTriggers = db.prepare('PRAGMA recursive_triggers').get() as { recursive_triggers?: unknown } | undefined;
+  const busyTimeout = db.prepare('PRAGMA busy_timeout').get() as { timeout?: unknown } | undefined;
+  const journalMode = db.prepare('PRAGMA journal_mode').get() as { journal_mode?: unknown } | undefined;
+  const synchronous = db.prepare('PRAGMA synchronous').get() as { synchronous?: unknown } | undefined;
+  return {
+    foreignKeys: Number(foreignKeys?.foreign_keys),
+    recursiveTriggers: Number(recursiveTriggers?.recursive_triggers),
+    busyTimeout: Number(busyTimeout?.timeout),
+    journalMode: typeof journalMode?.journal_mode === 'string' ? journalMode.journal_mode.toLowerCase() : '',
+    synchronous: Number(synchronous?.synchronous),
+  };
+}
+
+/**
+ * Refuse a handle whose connection-local safeguards were not applied.  The
+ * in-memory SQLite journal is necessarily `memory`; file-backed Store handles
+ * are required to use WAL after initializeSchema has selected it.
+ */
+export function assertDatabasePragmas(
+  db: DatabaseSync,
+  expectedJournalModes: readonly string[] = ['wal', 'memory'],
+): void {
+  const state = databasePragmas(db);
+  if (state.foreignKeys !== 1) throw new Error('database integrity validation failed: PRAGMA foreign_keys is not ON');
+  if (state.recursiveTriggers !== 1) throw new Error('database integrity validation failed: PRAGMA recursive_triggers is not ON');
+  if (state.busyTimeout !== 5_000) throw new Error('database integrity validation failed: PRAGMA busy_timeout is not 5000ms');
+  if (!expectedJournalModes.includes(state.journalMode)) {
+    throw new Error('database integrity validation failed: unsupported SQLite journal mode');
+  }
+  if (state.synchronous !== 1) throw new Error('database integrity validation failed: PRAGMA synchronous is not NORMAL');
+}
+
+/**
+ * Run SQLite's structural and relational integrity checks.  `quick_check` is
+ * cheap and catches most b-tree damage; `integrity_check` additionally checks
+ * every table/index constraint.  Both are retained because recovery must fail
+ * closed even when one check is accidentally weakened later.
+ */
+export function assertDatabaseIntegrity(
+  db: DatabaseSync,
+  options: { appendOnlyTriggers?: boolean } = {},
+): void {
+  const quickRows = db.prepare('PRAGMA quick_check').all() as Array<{ quick_check?: unknown }>;
+  if (quickRows.length === 0 || quickRows.some((row) => row.quick_check !== 'ok')) {
+    throw new Error('SQLite quick_check reported corruption');
+  }
+  const integrityRows = db.prepare('PRAGMA integrity_check').all() as Array<{ integrity_check?: unknown }>;
+  if (integrityRows.length === 0 || integrityRows.some((row) => row.integrity_check !== 'ok')) {
+    throw new Error('SQLite integrity_check reported corruption');
+  }
+  const foreignKeyRows = db.prepare('PRAGMA foreign_key_check').all();
+  if (foreignKeyRows.length > 0) throw new Error('SQLite foreign_key_check reported violations');
+  if (options.appendOnlyTriggers) validateAppendOnlyTriggerAuthority(db);
+}
+
+/** Reject tampered append-only metadata before idempotent DDL can repair it. */
+function validateAppendOnlyTriggerAuthority(db: DatabaseSync): void {
+  const expected: Array<{ name: string; table: string; sql: string }> = [
+    {
+      name: 'economic_events_append_only_update',
+      table: 'economic_events',
+      sql: "CREATE TRIGGER economic_events_append_only_update BEFORE UPDATE ON economic_events BEGIN SELECT RAISE(ABORT, 'economic event ledger is append-only'); END",
+    },
+    {
+      name: 'economic_events_append_only_delete',
+      table: 'economic_events',
+      sql: "CREATE TRIGGER economic_events_append_only_delete BEFORE DELETE ON economic_events BEGIN SELECT RAISE(ABORT, 'economic event ledger is append-only'); END",
+    },
+    {
+      name: 'economic_events_append_only_insert',
+      table: 'economic_events',
+      sql: "CREATE TRIGGER economic_events_append_only_insert BEFORE INSERT ON economic_events WHEN EXISTS (SELECT 1 FROM economic_events WHERE event_id = NEW.event_id) BEGIN SELECT RAISE(ABORT, 'economic event ledger is append-only'); END",
+    },
+    {
+      name: 'economic_fx_rate_observations_append_only_update',
+      table: 'economic_fx_rate_observations',
+      sql: "CREATE TRIGGER economic_fx_rate_observations_append_only_update BEFORE UPDATE ON economic_fx_rate_observations BEGIN SELECT RAISE(ABORT, 'historical FX rate observations are append-only'); END",
+    },
+    {
+      name: 'economic_fx_rate_observations_append_only_delete',
+      table: 'economic_fx_rate_observations',
+      sql: "CREATE TRIGGER economic_fx_rate_observations_append_only_delete BEFORE DELETE ON economic_fx_rate_observations BEGIN SELECT RAISE(ABORT, 'historical FX rate observations are append-only'); END",
+    },
+    {
+      name: 'economic_fx_rate_observations_append_only_insert',
+      table: 'economic_fx_rate_observations',
+      sql: "CREATE TRIGGER economic_fx_rate_observations_append_only_insert BEFORE INSERT ON economic_fx_rate_observations WHEN EXISTS (SELECT 1 FROM economic_fx_rate_observations WHERE observation_id = NEW.observation_id) BEGIN SELECT RAISE(ABORT, 'historical FX rate observations are append-only'); END",
+    },
+    {
+      name: 'economic_event_sources_append_only_update',
+      table: 'economic_event_sources',
+      sql: "CREATE TRIGGER economic_event_sources_append_only_update BEFORE UPDATE ON economic_event_sources BEGIN SELECT RAISE(ABORT, 'economic event source links are append-only'); END",
+    },
+    {
+      name: 'economic_event_sources_append_only_delete',
+      table: 'economic_event_sources',
+      sql: "CREATE TRIGGER economic_event_sources_append_only_delete BEFORE DELETE ON economic_event_sources BEGIN SELECT RAISE(ABORT, 'economic event source links are append-only'); END",
+    },
+    {
+      name: 'economic_event_sources_append_only_insert',
+      table: 'economic_event_sources',
+      sql: "CREATE TRIGGER economic_event_sources_append_only_insert BEFORE INSERT ON economic_event_sources WHEN EXISTS (SELECT 1 FROM economic_event_sources WHERE event_id = NEW.event_id AND source_event_id = NEW.source_event_id) BEGIN SELECT RAISE(ABORT, 'economic event source links are append-only'); END",
+    },
+    {
+      name: 'billing_mapping_no_update',
+      table: 'billing_record_mapping_versions',
+      sql: "CREATE TRIGGER billing_mapping_no_update BEFORE UPDATE ON billing_record_mapping_versions BEGIN SELECT RAISE(ABORT, 'billing mapping evidence is append-only'); END",
+    },
+    {
+      name: 'billing_mapping_no_delete',
+      table: 'billing_record_mapping_versions',
+      sql: "CREATE TRIGGER billing_mapping_no_delete BEFORE DELETE ON billing_record_mapping_versions BEGIN SELECT RAISE(ABORT, 'billing mapping evidence is append-only'); END",
+    },
+    {
+      name: 'economic_allocation_close_bindings_append_only_update',
+      table: 'economic_allocation_close_bindings',
+      sql: "CREATE TRIGGER economic_allocation_close_bindings_append_only_update BEFORE UPDATE ON economic_allocation_close_bindings BEGIN SELECT RAISE(ABORT, 'exact economic allocation close bindings are append-only'); END",
+    },
+    {
+      name: 'economic_allocation_close_bindings_append_only_delete',
+      table: 'economic_allocation_close_bindings',
+      sql: "CREATE TRIGGER economic_allocation_close_bindings_append_only_delete BEFORE DELETE ON economic_allocation_close_bindings BEGIN SELECT RAISE(ABORT, 'exact economic allocation close bindings are append-only'); END",
+    },
+    {
+      name: 'economic_allocation_close_bindings_append_only_insert',
+      table: 'economic_allocation_close_bindings',
+      sql: "CREATE TRIGGER economic_allocation_close_bindings_append_only_insert BEFORE INSERT ON economic_allocation_close_bindings WHEN EXISTS (SELECT 1 FROM economic_allocation_close_bindings WHERE allocation_run_id = NEW.allocation_run_id) BEGIN SELECT RAISE(ABORT, 'exact economic allocation close bindings are append-only'); END",
+    },
+  ];
+  const generatedAuthorities: ReadonlyArray<{ table: string; key: string; message: string }> = [
+    { table: 'epistemic_nodes', key: 'node_id = NEW.node_id', message: 'epistemic ledger is append-only' },
+    { table: 'epistemic_evidence', key: 'evidence_id = NEW.evidence_id', message: 'epistemic ledger is append-only' },
+    { table: 'epistemic_claims', key: 'claim_id = NEW.claim_id', message: 'epistemic ledger is append-only' },
+    { table: 'epistemic_assumptions', key: 'assumption_id = NEW.assumption_id', message: 'epistemic ledger is append-only' },
+    { table: 'epistemic_witnesses', key: 'witness_id = NEW.witness_id', message: 'epistemic ledger is append-only' },
+    { table: 'epistemic_derivations', key: 'derivation_id = NEW.derivation_id', message: 'epistemic ledger is append-only' },
+    { table: 'epistemic_edges', key: 'from_id = NEW.from_id AND to_id = NEW.to_id AND relation = NEW.relation', message: 'epistemic ledger is append-only' },
+    { table: 'epistemic_revocations', key: 'event_id = NEW.event_id', message: 'epistemic ledger is append-only' },
+    { table: 'economic_allocation_runs', key: 'allocation_run_id = NEW.allocation_run_id', message: 'exact economic allocation runs are append-only' },
+    { table: 'economic_allocation_lineage', key: 'allocation_run_id = NEW.allocation_run_id AND item_kind = NEW.item_kind AND item_index = NEW.item_index AND source_event_id = NEW.source_event_id', message: 'exact economic allocation lineage is append-only' },
+  ];
+  for (const authority of generatedAuthorities) {
+    for (const operation of ['UPDATE', 'DELETE'] as const) {
+      const name = `${authority.table}_append_only_${operation.toLowerCase()}`;
+      expected.push({
+        name,
+        table: authority.table,
+        sql: `CREATE TRIGGER ${name} BEFORE ${operation} ON ${authority.table} BEGIN SELECT RAISE(ABORT, '${authority.message}'); END`,
+      });
+    }
+    const name = `${authority.table}_append_only_insert`;
+    expected.push({
+      name,
+      table: authority.table,
+      sql: `CREATE TRIGGER ${name} BEFORE INSERT ON ${authority.table} WHEN EXISTS (SELECT 1 FROM ${authority.table} WHERE ${authority.key}) BEGIN SELECT RAISE(ABORT, '${authority.message}'); END`,
+    });
+  }
+  const existingTables = new Set((db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table'",
+  ).all() as Array<{ name: string }>).map((row) => row.name));
+  const defects = expected.filter((item) => {
+    if (!existingTables.has(item.table)) return false;
+    const actual = db.prepare(
+      "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+    ).get(item.name) as { tbl_name: string; sql: string | null } | undefined;
+    return !actual || actual.tbl_name !== item.table
+      || normalizeAuthoritySql(actual.sql) !== normalizeAuthoritySql(item.sql);
+  });
+  if (defects.length > 0) {
+    throw new Error('database integrity validation failed: append-only trigger authority mismatch');
+  }
 }
 
 /** Idempotent schema migrations for DBs created before a column existed. */
@@ -685,6 +1043,11 @@ function migrate(db: DatabaseSync): void {
     // certainty this column exists to remove. New rows are stamped at insert.
     db.prepare("ALTER TABLE requests ADD COLUMN attribution_basis TEXT NOT NULL DEFAULT 'legacy_unknown'").run();
   }
+  if (!cols.some((c) => c.name === 'capture_coverage')) {
+    // Existing rows predate response-capture coverage tracking. Preserve their
+    // uncertainty rather than upgrading them to a complete observation.
+    db.prepare("ALTER TABLE requests ADD COLUMN capture_coverage TEXT NOT NULL DEFAULT 'legacy_unknown'").run();
+  }
   const unitCols = db.prepare('PRAGMA table_info(realization_units)').all() as Array<{ name: string }>;
   if (!unitCols.some((c) => c.name === 'cost_scope')) {
     // No backfill. A snapshot written before this column does not record
@@ -707,6 +1070,12 @@ function migrate(db: DatabaseSync): void {
     // unit identity, and deriving one from unit_json would make ordinary
     // realization data appear to be randomized-study evidence.
     db.prepare('ALTER TABLE realization_units ADD COLUMN causal_unit_id_digest TEXT').run();
+  }
+  const proposalCols = db.prepare('PRAGMA table_info(proposals)').all() as Array<{ name: string }>;
+  if (!proposalCols.some((c) => c.name === 'capture_coverage')) {
+    // Existing proposal rows were captured before truncation was tracked. Keep
+    // their coverage unknown rather than silently upgrading them to complete.
+    db.prepare("ALTER TABLE proposals ADD COLUMN capture_coverage TEXT NOT NULL DEFAULT 'legacy_unknown'").run();
   }
   const obsRunCols = db.prepare('PRAGMA table_info(openai_cost_observation_runs)').all() as Array<{ name: string }>;
   if (obsRunCols.length > 0 && !obsRunCols.some((c) => c.name === 'source_kind')) {
@@ -757,6 +1126,166 @@ function installCausalImmutability(db: DatabaseSync): void {
       ' BEGIN SELECT RAISE(ABORT, \'causal evidence is append-only\'); END',
     ).run();
   }
+}
+
+/**
+ * Create and protect the Trusted Epistemic Kernel tables. This is exported so
+ * the standalone kernel ledger can initialize an isolated DatabaseSync handle,
+ * while all DDL remains physically owned by this schema module.
+ */
+export function initializeEpistemicSchema(db: DatabaseSync): void {
+  db.prepare('PRAGMA foreign_keys = ON').run();
+  runScript(db, EPISTEMIC_SCHEMA);
+  const tables = [
+    'epistemic_nodes',
+    'epistemic_evidence',
+    'epistemic_claims',
+    'epistemic_assumptions',
+    'epistemic_witnesses',
+    'epistemic_derivations',
+    'epistemic_edges',
+    'epistemic_revocations',
+  ];
+  for (const table of tables) {
+    const updateTrigger = 'epistemic_' + table.replace('epistemic_', '') + '_append_only_update';
+    const deleteTrigger = 'epistemic_' + table.replace('epistemic_', '') + '_append_only_delete';
+    db.prepare(
+      'CREATE TRIGGER IF NOT EXISTS ' + updateTrigger +
+      ' BEFORE UPDATE ON ' + table +
+      ' BEGIN SELECT RAISE(ABORT, \'epistemic ledger is append-only\'); END',
+    ).run();
+    db.prepare(
+      'CREATE TRIGGER IF NOT EXISTS ' + deleteTrigger +
+      ' BEFORE DELETE ON ' + table +
+      ' BEGIN SELECT RAISE(ABORT, \'epistemic ledger is append-only\'); END',
+    ).run();
+  }
+  const duplicateGuards: ReadonlyArray<{ table: string; key: string }> = [
+    { table: 'epistemic_nodes', key: 'node_id = NEW.node_id' },
+    { table: 'epistemic_evidence', key: 'evidence_id = NEW.evidence_id' },
+    { table: 'epistemic_claims', key: 'claim_id = NEW.claim_id' },
+    { table: 'epistemic_assumptions', key: 'assumption_id = NEW.assumption_id' },
+    { table: 'epistemic_witnesses', key: 'witness_id = NEW.witness_id' },
+    { table: 'epistemic_derivations', key: 'derivation_id = NEW.derivation_id' },
+    { table: 'epistemic_edges', key: 'from_id = NEW.from_id AND to_id = NEW.to_id AND relation = NEW.relation' },
+    { table: 'epistemic_revocations', key: 'event_id = NEW.event_id' },
+  ];
+  for (const guard of duplicateGuards) {
+    const trigger = 'epistemic_' + guard.table.replace('epistemic_', '') + '_append_only_insert';
+    db.prepare(
+      'CREATE TRIGGER IF NOT EXISTS ' + trigger +
+      ' BEFORE INSERT ON ' + guard.table +
+      ' WHEN EXISTS (SELECT 1 FROM ' + guard.table + ' WHERE ' + guard.key + ')' +
+      ' BEGIN SELECT RAISE(ABORT, \'epistemic ledger is append-only\'); END',
+    ).run();
+  }
+}
+
+/**
+ * Create and protect the immutable exact-Money economic event table. DDL stays
+ * in this schema module; `src/economics/ledger.ts` performs validated DML only.
+ */
+export function initializeEconomicSchema(db: DatabaseSync): void {
+  db.prepare('PRAGMA foreign_keys = ON').run();
+  runScript(db, ECONOMIC_SCHEMA);
+  const updateTrigger = 'economic_events_append_only_update';
+  const deleteTrigger = 'economic_events_append_only_delete';
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS ' + updateTrigger +
+    ' BEFORE UPDATE ON economic_events' +
+    ' BEGIN SELECT RAISE(ABORT, \'economic event ledger is append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS ' + deleteTrigger +
+    ' BEFORE DELETE ON economic_events' +
+    ' BEGIN SELECT RAISE(ABORT, \'economic event ledger is append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_events_append_only_insert' +
+    ' BEFORE INSERT ON economic_events' +
+    ' WHEN EXISTS (SELECT 1 FROM economic_events WHERE event_id = NEW.event_id)' +
+    ' BEGIN SELECT RAISE(ABORT, \'economic event ledger is append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_fx_rate_observations_append_only_update' +
+    ' BEFORE UPDATE ON economic_fx_rate_observations' +
+    ' BEGIN SELECT RAISE(ABORT, \'historical FX rate observations are append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_fx_rate_observations_append_only_delete' +
+    ' BEFORE DELETE ON economic_fx_rate_observations' +
+    ' BEGIN SELECT RAISE(ABORT, \'historical FX rate observations are append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_fx_rate_observations_append_only_insert' +
+    ' BEFORE INSERT ON economic_fx_rate_observations' +
+    ' WHEN EXISTS (SELECT 1 FROM economic_fx_rate_observations WHERE observation_id = NEW.observation_id)' +
+    ' BEGIN SELECT RAISE(ABORT, \'historical FX rate observations are append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_event_sources_append_only_update' +
+    ' BEFORE UPDATE ON economic_event_sources' +
+    ' BEGIN SELECT RAISE(ABORT, \'economic event source links are append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_event_sources_append_only_delete' +
+    ' BEFORE DELETE ON economic_event_sources' +
+    ' BEGIN SELECT RAISE(ABORT, \'economic event source links are append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_event_sources_append_only_insert' +
+    ' BEFORE INSERT ON economic_event_sources' +
+    ' WHEN EXISTS (SELECT 1 FROM economic_event_sources WHERE event_id = NEW.event_id AND source_event_id = NEW.source_event_id)' +
+    ' BEGIN SELECT RAISE(ABORT, \'economic event source links are append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_allocation_runs_append_only_update' +
+    ' BEFORE UPDATE ON economic_allocation_runs' +
+    ' BEGIN SELECT RAISE(ABORT, \'exact economic allocation runs are append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_allocation_runs_append_only_delete' +
+    ' BEFORE DELETE ON economic_allocation_runs' +
+    ' BEGIN SELECT RAISE(ABORT, \'exact economic allocation runs are append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_allocation_runs_append_only_insert' +
+    ' BEFORE INSERT ON economic_allocation_runs' +
+    ' WHEN EXISTS (SELECT 1 FROM economic_allocation_runs WHERE allocation_run_id = NEW.allocation_run_id)' +
+    ' BEGIN SELECT RAISE(ABORT, \'exact economic allocation runs are append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_allocation_lineage_append_only_update' +
+    ' BEFORE UPDATE ON economic_allocation_lineage' +
+    ' BEGIN SELECT RAISE(ABORT, \'exact economic allocation lineage is append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_allocation_lineage_append_only_delete' +
+    ' BEFORE DELETE ON economic_allocation_lineage' +
+    ' BEGIN SELECT RAISE(ABORT, \'exact economic allocation lineage is append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_allocation_lineage_append_only_insert' +
+    ' BEFORE INSERT ON economic_allocation_lineage' +
+    ' WHEN EXISTS (SELECT 1 FROM economic_allocation_lineage WHERE allocation_run_id = NEW.allocation_run_id AND item_kind = NEW.item_kind AND item_index = NEW.item_index AND source_event_id = NEW.source_event_id)' +
+    ' BEGIN SELECT RAISE(ABORT, \'exact economic allocation lineage is append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_allocation_close_bindings_append_only_update' +
+    ' BEFORE UPDATE ON economic_allocation_close_bindings' +
+    ' BEGIN SELECT RAISE(ABORT, \'exact economic allocation close bindings are append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_allocation_close_bindings_append_only_delete' +
+    ' BEFORE DELETE ON economic_allocation_close_bindings' +
+    ' BEGIN SELECT RAISE(ABORT, \'exact economic allocation close bindings are append-only\'); END',
+  ).run();
+  db.prepare(
+    'CREATE TRIGGER IF NOT EXISTS economic_allocation_close_bindings_append_only_insert' +
+    ' BEFORE INSERT ON economic_allocation_close_bindings' +
+    ' WHEN EXISTS (SELECT 1 FROM economic_allocation_close_bindings WHERE allocation_run_id = NEW.allocation_run_id)' +
+    ' BEGIN SELECT RAISE(ABORT, \'exact economic allocation close bindings are append-only\'); END',
+  ).run();
 }
 
 /** Operator mappings are evidence, not mutable configuration. */
@@ -1598,6 +2127,7 @@ export function initializeSchema(
   configureDatabaseConnection(db);
   runScript(db, 'PRAGMA journal_mode = WAL');
   runScript(db, 'PRAGMA synchronous = NORMAL');
+  assertDatabasePragmas(db);
   const preflightState = options.expectedCausalV2State ?? causalV2SchemaAttestation(db).state;
   db.prepare('BEGIN IMMEDIATE').run();
   try {
@@ -1613,7 +2143,13 @@ export function initializeSchema(
     if (lockedState === 'incomplete' && !exactSlice3AssignmentSchema(db)) {
       throw new Error('causal v2 schema validation failed: CAUSAL_V2_UNRECOGNIZED_PREDECESSOR');
     }
+    // Inspect the retained database while the migration lock is held.  This
+    // must precede idempotent DDL, which would otherwise recreate a deleted
+    // trigger and erase the evidence of tampering.
+    assertDatabaseIntegrity(db, { appendOnlyTriggers: true });
     runScript(db, SCHEMA);
+    initializeEpistemicSchema(db);
+    initializeEconomicSchema(db);
     migrate(db);
     installCausalImmutability(db);
     installBillingMappingImmutability(db);
@@ -1624,6 +2160,14 @@ export function initializeSchema(
         'causal v2 schema validation failed: ' +
         (finalAttestation.defectIds.join(',') || 'CAUSAL_V2_SCHEMA_INCOMPLETE'),
       );
+    }
+    assertDatabaseIntegrity(db, { appendOnlyTriggers: true });
+    const schemaVersion = readSchemaVersion(db);
+    if (schemaVersion > CURRENT_SCHEMA_VERSION) {
+      throw new Error(`schema version ${schemaVersion} is newer than supported version ${CURRENT_SCHEMA_VERSION}`);
+    }
+    if (schemaVersion < CURRENT_SCHEMA_VERSION) {
+      db.prepare(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`).run();
     }
     db.prepare('COMMIT').run();
   } catch (error) {

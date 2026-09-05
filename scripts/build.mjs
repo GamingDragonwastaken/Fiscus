@@ -20,6 +20,39 @@ const dist = join(root, 'dist');
 const tsc = join(root, 'node_modules', 'typescript', 'bin', 'tsc');
 const RENAME_RETRY_MS = 5_000;
 const waitCell = new Int32Array(new SharedArrayBuffer(4));
+const sharedDashboardContract = join(root, 'src', 'dashboard', 'contracts.ts');
+// Relative first, absolute derived. `sourceFingerprint` joins its input paths
+// onto the root, so the list it is given must be root-relative; putting the
+// ABSOLUTE form of this file into that list is what broke `--web` at `e00f7f9`,
+// producing `<root>/<root>/src/...` and an ENOENT nothing in the normal
+// workflow ever ran into. Deriving one from the other keeps them from drifting.
+const sharedDashboardTypesPath = join('src', 'dashboard', 'shared-types.ts');
+const sharedDashboardTypes = join(root, sharedDashboardTypesPath);
+const generatedBrowserDashboardContract = join(root, 'src', 'dashboard', 'web', 'app', 'core', 'generated-contract.ts');
+const dashboardPayloadContractGenerator = join(root, 'scripts', 'generate-dashboard-payload-contract.mjs');
+
+/** Keep the browser's no-node copy byte-identical to the server contract. */
+function syncSharedDashboardContract() {
+  // Builders start concurrently in the supported workflow. The generated
+  // target is a source input for both TypeScript passes, so even a byte-identical
+  // copy must be serialized: Windows can reject a second copy while the first
+  // process still has the destination open. Reuse the same gate as publication
+  // and the launcher; this is deliberately before source fingerprint capture.
+  const release = acquirePublicationLock(root);
+  try {
+    copyFileSync(sharedDashboardContract, generatedBrowserDashboardContract);
+    const generated = spawnSync(process.execPath, [dashboardPayloadContractGenerator], {
+      cwd: root,
+      stdio: 'inherit',
+    });
+    if (generated.error) throw generated.error;
+    if (generated.status !== 0) throw new Error(`dashboard payload contract generation failed (${generated.status ?? 1})`);
+  } finally {
+    release();
+  }
+}
+
+syncSharedDashboardContract();
 
 class BuildFailure extends Error {
   constructor(label, exitCode) {
@@ -176,7 +209,7 @@ function publish(stage, { prune, inputPaths, sourceGeneration }) {
  */
 const webOnly = process.argv.includes('--web');
 const sourceInputs = webOnly
-  ? ['src/dashboard/web']
+  ? ['src/dashboard/web', sharedDashboardTypesPath]
   : ['src', 'tsconfig.json', 'tsconfig.build.json'];
 const SOURCE_RETRY_LIMIT = 1;
 let exitCode = 0;

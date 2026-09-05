@@ -29,6 +29,7 @@ import { cmdShow, cmdSources, cmdExport, cmdConfig, cmdBudget, cmdPrune, cmdProj
 import { cmdStart, cmdDemo, cmdPricing, cmdBaseline, cmdReprice } from './cli/runCmd.ts';
 import { cmdBackup, cmdRestore } from './cli/backupCmd.ts';
 import { cmdDiagnostics } from './cli/diagnosticsCmd.ts';
+import { cmdEconomic } from './cli/economicCmd.ts';
 
 function cmdHelp(): void {
   console.log(`
@@ -52,6 +53,12 @@ function cmdHelp(): void {
                           Ordinary value, Lift, and price scenarios cannot become
                           causal claims; this command never changes provider routing.
     today | week | month  Show spend for a window      (--json)
+    economic              Inspect exact economic events, roles, bases, and legacy coverage
+                          (--days N | --all, --target-currency UNIT, --as-of <ISO>,
+                          --effective-at <ISO>, --json). Period controls use canonical
+                          UTC instants: --close-status|--finalize|--reopen
+                          --from <ISO> --to <ISO> [--recorded-at <ISO>]
+                          [--reason <text>] [--as-of <ISO>] [--json]
     sources               Spend by connected source — each AI tool routed here
                           (--all for all-time, --json)
     connect <tool>        Connect an AI tool as a source so its spend is metered:
@@ -103,8 +110,10 @@ function cmdHelp(): void {
                           value/RoI to a team server YOU run (Fiscus hosts
                           nothing). --dry-run to preview, --pubkey to publish
                           this machine's rollup identity, --watch to keep
-                          pushing on an interval (--window D, --project
-                          <name>, --every N, --json)
+                          pushing on an interval (--window D, --every N,
+                          --json). --project <name> previews one project with
+                          --dry-run; a scoped rollup is never sent, because the
+                          server reads your latest push as your whole window
     report --kind K       Wire an outcome: code --commit <hash>, non-code --session <id>
                           kinds: tested|merged|shipped|incident|used|resolved|published|…
     evidence github       Signed, offline CI evidence. 'emit' runs in a protected
@@ -118,8 +127,9 @@ function cmdHelp(): void {
     receipt --repo <path> Emit signed, verifiable value receipts (--unit <hash>, --json)
                           Publish identity:  receipt --pubkey
                           Verify + pin signer: receipt --verify <file> --key-id <id>
-    yield --repo <path>   AI Yield (survival lens): durable lines per $ — survival, churn
-                          (--window DAYS, --limit N, --json)
+    yield --repo <path>   Artifact persistence (legacy yield lens): retained introduced
+                          lines per $ — retention and non-retention (--window DAYS,
+                          --limit N, --json)
     budget                Set caps: --daily N --soft N --session N --runaway N --window S
                           --include-imported on|off: whether imported subscription
                           spend counts toward cap ENFORCEMENT (default off — the
@@ -131,7 +141,9 @@ function cmdHelp(): void {
                           Deliver to your own webhook: --set-webhook <url>, then --notify
                           (cron it; sends ONLY alert metadata — never prompts/code/keys)
     export                Export the request ledger for BI/finance (--csv default | --json,
-                          --days N | --all, --out <file>; otherwise stdout)
+                          --economic for exact Money/lineage, --days N | --all,
+                          --target-currency UNIT, --as-of <ISO>, --effective-at <ISO>,
+                          --out <file>; otherwise stdout)
     init                  Write default config + print setup steps
     doctor                First-run health check: config, DB, proxy, caps, data quality
     config                Show config and file paths    (--json)
@@ -233,6 +245,10 @@ async function main(): Promise<void> {
       break;
     case 'month':
       cmdShow('month', flags);
+      break;
+    case 'economic':
+    case 'economics':
+      cmdEconomic(flags);
       break;
     case 'sources':
       cmdSources(flags);
@@ -387,7 +403,16 @@ process.stdout.on('error', (err: NodeJS.ErrnoException) => {
   throw err;
 });
 
-main().catch((err) => {
-  console.error('  Fiscus error:', err);
-  process.exitCode = 1;
-});
+// Defer command dispatch until the launcher has finished importing the compiled
+// module and released its publication lock. Some commands (notably `demo`)
+// perform substantial synchronous work before their first `await`; invoking
+// them directly here would make every concurrent CLI reader hold the build gate
+// for the whole command and can starve a legitimate publication queue. The
+// modules are fully loaded before this callback runs, so publication can no
+// longer create a missing-dependency window for this process.
+export const cliCompletion = new Promise<void>((resolve) => setImmediate(() => {
+  main().catch((err) => {
+    console.error('  Fiscus error:', err);
+    process.exitCode = 1;
+  }).finally(resolve);
+}));

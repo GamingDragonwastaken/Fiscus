@@ -154,12 +154,17 @@ export function valueView(): Node {
       }
 
       const funnel = matured?.instrumentation ?? {};
+      // Gates where two sources disagreed. Shown separately from the counts
+      // because a contradiction is not a measurement of the gate, and because
+      // the legacy projection renders it as a plain failure (AII-003).
+      const gateConflicts = Object.entries(matured?.gateConflicts ?? {}).filter(([, n]) => n > 0);
       const waste = (matured?.wasteByStage ?? []).filter((w) => w.stage !== 'realized');
       const wasteCost = waste.reduce((s, w) => s + w.costUsd, 0);
       const bounds = matured?.realizationBounds ?? null;
       const team = d.team ?? null;
       const drift = d.drift ?? null;
       const ret = d.roi?.returnRatio ?? null;
+      const economic = matured?.economic ?? null;
 
       return h('div', null,
         d.demo ? h('div', { class: 'banner banner-demo' },
@@ -195,12 +200,30 @@ export function valueView(): Node {
                 ? `${count(d.realization?.costStaleUnits)} unit(s) carry stale cost attribution.`
                 : `${count(d.realization?.costStaleUnits)} of these have out-of-date cost information.`) })
             : null),
+          economic
+            ? h('p', { class: 'basis', role: 'status', text: () => {
+                if (economic.coverage === 'legacy_unknown' || economic.total === null) {
+                  return isPrecise()
+                    ? 'Exact economic coverage: legacy_unknown — these snapshots predate exact request evidence, so numeric costs are compatibility projections.'
+                    : 'Exact economic coverage is not available for these snapshots; the cost figures are legacy compatibility totals.';
+                }
+                const total = economic.total;
+                if (economic.coverage === 'partial' || total.unresolvedRequests > 0) {
+                  return isPrecise()
+                    ? `Exact economic coverage: partial — ${total.amountText} effective spend resolved across ${count(total.requestCount)} requests; ${count(total.unresolvedRequests)} unresolved legacy request(s) remain in the numeric compatibility total.`
+                    : `Some exact cost evidence is available (${total.amountText}), but ${count(total.unresolvedRequests)} request(s) lack it; the headline cost includes a compatibility projection.`;
+                }
+                return isPrecise()
+                  ? `Exact economic coverage: complete — ${total.amountText} effective spend across ${count(total.requestCount)} requests; source bases: ${total.sourceBases.join(', ') || 'none'}.`
+                  : `Cost evidence is complete for ${count(total.requestCount)} requests (${total.amountText} exact effective spend).`;
+              } })
+            : null,
 
         // The value claim and the cost figure, kept apart on purpose.
         //
-        // The payload spells two different quantities `realizedValueUsd`:
-        // `roi.returnRatio.realizedValueUsd` is manual-equivalent value produced,
-        // and `matured.realizedValueUsd` is the attributed SPEND on units that
+        // Two different quantities sit side by side:
+        // `roi.returnRatio.manualEquivalentValueUsd` is value produced, and
+        // `matured.spendOnRealizedUnitsUsd` is the attributed SPEND on units that
         // realized. An earlier version of this screen showed the second one under
         // the heading "what it produced", which reported a cost as a value --
         // the collapse this whole product is built to refuse. They now sit in
@@ -210,7 +233,7 @@ export function valueView(): Node {
               h('div', { class: 'card' },
                 h('div', { class: 'card-head' },
                   h('span', { class: 'card-title', text: () => (isPrecise() ? 'Realized value' : 'What the work was worth') })),
-                h('div', { class: 'stat', text: usd(ret.realizedValueUsd) }),
+                h('div', { class: 'stat', text: usd(ret.manualEquivalentValueUsd) }),
                 h('span', { class: 'basis', text: () => (isPrecise()
                   ? 'manual-equivalent dollars for realized work, net of rework'
                   : 'what that work would have cost to do by hand instead') })),
@@ -276,8 +299,8 @@ export function valueView(): Node {
           ? h('section', { class: 'section' },
               h('h2', { class: 'section-title', text: () => (isPrecise() ? 'Where value is lost' : 'Where the work fell over') }),
               h('p', { class: 'view-plain', text: () => (isPrecise()
-                ? `Of ${usd(matured?.totalCostUsd)} attributed to matured units, ${usd(matured?.realizedValueUsd)} reached a kept outcome and ${usd(wasteCost)} did not. These are spend figures, not value.`
-                : `Of the ${usd(matured?.totalCostUsd)} spent on this work, ${usd(matured?.realizedValueUsd)} went on work that stuck and ${usd(wasteCost)} went on work that did not.`) }),
+                ? `Of ${usd(matured?.totalCostUsd)} attributed to matured units, ${usd(matured?.spendOnRealizedUnitsUsd)} reached a kept outcome and ${usd(wasteCost)} did not. These are spend figures, not value.`
+                : `Of the ${usd(matured?.totalCostUsd)} spent on this work, ${usd(matured?.spendOnRealizedUnitsUsd)} went on work that stuck and ${usd(wasteCost)} went on work that did not.`) }),
               h('div', { class: 'ledger' },
                 ...waste
                   .slice()
@@ -302,7 +325,12 @@ export function valueView(): Node {
               h('div', { class: 'facts' },
                 ...Object.entries(funnel).map(([stage, n]) => h('div', { class: 'fact' },
                   h('span', { class: 'fact-key', text: () => (isPrecise() ? stage : (GATE_WORDS[stage] ?? stage)) }),
-                  h('span', { class: 'fact-val', text: count(n) })))))
+                  h('span', { class: 'fact-val', text: count(n) })))),
+              gateConflicts.length > 0
+                ? h('p', { class: 'section-note', text: () => (isPrecise()
+                    ? `Contradicted evidence at ${gateConflicts.map(([stage, n]) => `${stage} (${n})`).join(', ')}: sources both supported and refuted these gates. The unit records a failure only because the three-valued projection has no other option — it is unadjudicated, not refuted.`
+                    : `Some evidence disagrees with itself at ${gateConflicts.map(([stage]) => (GATE_WORDS[stage] ?? stage)).join(', ')}. That is a conflict to resolve, not a result.`) })
+                : null)
           : null,
 
         d.reclaimed && typeof d.reclaimed.workWeeksSaved === 'number'

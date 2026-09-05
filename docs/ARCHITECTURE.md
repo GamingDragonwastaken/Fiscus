@@ -122,10 +122,18 @@ in the GUI is not a compile error, and reading an absent field yields `undefined
 which renders as whatever a screen shows for "absent": usually a legitimate,
 honest-looking state. That failure mode shipped three times (a breakdown table of
 em-dashes; "no cap set" on a machine with a $30 cap enforcing; a silently
-discarded settings patch). `test/dashboard-contract.test.ts` now derives the
-endpoint→interface pairings from the API client itself, fetches every read
-endpoint against a real server, and asserts every required field actually
-arrives.
+discarded settings patch). The no-node route/envelope descriptor in
+`src/dashboard/contracts.ts` is copied byte-for-byte into the browser build
+under the publication lock; the server route table and modern client consume its
+paths/methods/guards, and its top-level payload contracts fail closed at runtime.
+`test/dashboard-contract.test.ts` derives endpoint→interface pairings from the
+canonical descriptor, fetches every JSON read envelope against a real server,
+and asserts every required field and primitive/container kind actually arrives.
+Nested browser-interface metadata is generated with an exact `api.ts` source
+hash, while the hand-written declarations and classic inline HTML remain
+explicit follow-on migration surfaces. The GUI parity registry additionally
+exposes immutable `CapabilitySpec` metadata for consequence, authority,
+egress, credentials, reversibility, assurance, and surface bindings.
 
 ### Component responsibilities
 
@@ -139,8 +147,8 @@ arrives.
 | Alerts | `src/alerts/detect.ts` | Detect governance conditions (budget, spike, runaway, throttling, value crater, est. pricing); pure detector + store-backed wrapper |
 | Export | `src/export/csv.ts` | Serialize the request ledger to CSV (RFC-4180 quoting) / JSON for BI; CLI `export` + dashboard `/api/export.csv` |
 | Git correlation | `src/git/correlate.ts` | Read commits via `git`, attribute spend in the window before each |
-| Quality / Yield | `src/git/quality.ts` | Survival lens: code survival (blame at HEAD), revert detection, AI Yield, churn |
-| Realization | `src/value/realization.ts` | Assembles each commit's gate funnel; Realization Rate, Realized Value, acceptance |
+| Artifact persistence / Yield | `src/git/quality.ts` | Artifact-retention observation (blame at HEAD), revert detection, and compatibility yield/churn projections; not code quality |
+| Realization | `src/value/realization.ts`, `src/value/epistemic.ts` | Assembles each commit's gate funnel; Realization Rate, Realized Value, acceptance; automatically issues exact mature lifecycle Evidence/Claims on persistence |
 | Gate ladder | `src/value/gates.ts` | The eight gates + pass/fail/unknown funnel scoring |
 | Proposals | `src/value/proposals.ts` | Extract proposed edits from responses; edit-distance acceptance |
 | Lift baseline | `src/value/liftBaseline.ts` | Resolve manual-minutes-per-task-type: cited/refreshable population prior + personal pre-tracking git history, combined by continuous-data empirical-Bayes shrinkage |
@@ -148,6 +156,7 @@ arrives.
 | System scan | `src/scan/scan.ts`, `src/scan/knownApps.ts` | Proactive, read-only discovery: the 3 importable tools, repos under a root, and a wider best-effort inventory of other AI coding tools detected (never a claim of import capability) |
 | Config | `src/config.ts` | Load/save `~/.fiscus/config.json`, resolve paths |
 | Dashboard API | `src/dashboard/server.ts` | JSON API over the store, plus six CSRF-guarded mutating routes (`/api/import`, `/api/discover`, `POST /api/scan`, `/api/judge`, `/api/settings/update`, `/api/settings/clear-proposals`) |
+| Dashboard contracts/types | `src/dashboard/contracts.ts`, `src/dashboard/shared-types.ts`, `scripts/generate-dashboard-payload-contract.mjs` | One no-runtime source for named payload interfaces plus route/method/envelope metadata; locked generation emits the browser copy and nested runtime contract hash |
 | Web GUI | `src/dashboard/web/` | The browser application: four-claim spine, seven routes, preview-then-commit drawer. Built, not inlined — see §2.1 |
 | CLI | `src/cli.ts` + `src/cli/` | Thin dispatcher (`src/cli.ts`: help, version, main) over per-command modules — `showCmd`, `valueCmd`, `teamCmd`, `importCmd`, `connectCmd`, `opsCmd`, `runCmd`, with shared `ui`/`flags` helpers |
 
@@ -216,7 +225,7 @@ Cost = `input·R_in + output·R_out + cacheWrite·R_cw + cacheRead·R_cr`. The r
 You can't know a request's cost before it runs (output is unknown). So the guard blocks on *already-crossed* daily/session caps and on spend velocity inside a sliding window (the runaway-loop signature). This is what's actually enforceable, framed honestly.
 
 ### D5 — The Realization Standard: production measured as verified outcome, with the dollar as one lens
-The product's positive thesis is a real *unit of account* for AI-assisted work — defined in full in **[THE-STANDARD.md](THE-STANDARD.md)**. It supersedes two earlier attempts that were both rebuilt, not shipped: the research's subjective "AI Efficiency Score", and our own first pass (**AI Yield = surviving lines ÷ cost**, which was lines-of-code with a price tag — it rewards verbosity, ignores correctness, and stapled two existing tools together).
+The product's positive thesis is a real *unit of account* for AI-assisted work — defined in full in **[THE-STANDARD.md](THE-STANDARD.md)**. It supersedes two earlier attempts that were both rebuilt, not shipped: the research's subjective "AI Efficiency Score", and our own first pass (a retained-lines-per-dollar lens that was too easy to read as a quality measure because it put a price on lines without measuring correctness).
 
 The Standard instead scores each commit through a **funnel of eight objective gates** (`src/value/`): Proposed → Accepted → Committed → Tested → Merged → Shipped → Survived → Clean. Three headline numbers fall out:
 
@@ -228,6 +237,7 @@ Design properties that make it a standard rather than a dashboard:
 - **`unknown` is first-class, never `fail`** (`src/value/gates.ts`). A gate you haven't wired stays `unknown` and the report shows instrumentation coverage. The model spans the whole lifecycle; the engine fills in what it observes; gaps are explicit and pluggable via `fiscus report` (ingests test/merge/ship/incident signals into `gate_signals`).
 - **Maturity holds the line on honesty**: Survived and Clean are `unknown` until the window elapses, so no unit is called realized prematurely.
 - **Value Receipts** (`src/value/receipt.ts`): each unit emits an ed25519-signed, canonical record of cost → gate verdicts → outcome. Verification separates two guarantees: **integrity** (body unaltered, signature valid, claimed keyId honestly fingerprints the embedded key) always holds from the receipt alone; **authenticity** (signed by the expected party) requires an out-of-band trust anchor — the verifier pins the publisher's keyId (`receipt --verify <file> --key-id <id>`, publish yours with `receipt --pubkey`). Without a pin, a self-consistent forgery would read as intact, so the CLI flags unpinned checks explicitly. This is what turns a private number into a portable, auditable unit of account.
+- **Realization kernel bridge** (`src/value/epistemic.ts`): the canonical persisted realization path automatically and atomically issues one idempotent `value.realization_recorded` Evidence/Claim per mature unit whose eight declared gates are all observed `pass` and whose effective request-lineage attribution is complete and re-derived from the Store ledger. The payload retains commit/window/gate/economic provenance and a digest-bound identity. Its profile is provisional, self-authenticated and non-causal; it does not assert business value, provider billing, settlement or project-specific cost when the source scope is the project-blind window basis. Partial, maturing, stale, synthetic-demo and legacy snapshots remain outside this bridge.
 - **Honest scope**: proposal capture covers **both streaming (SSE tool-call reassembly, `src/proxy/stream-proposals.ts`) and non-streaming** responses through identical extraction; Tested/Merged/Shipped depend on ingested signals; Survived/Clean are "to date". None of these are faked — unobserved gates read `unknown`. (Full reasoning in RESEARCH-REVIEW §3.)
 
 ### D6 — Fail open for measurement, fail closed for declared egress integrity

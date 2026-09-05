@@ -13,7 +13,9 @@ import {
   type OpenAiCostsPreview,
 } from '../billing/openaiCosts.ts';
 import { newOpenAiScopeDeclaration } from '../billing/scope.ts';
-import { displayUsd, signedUsd, type ReconciliationReadiness, type ReconciliationRun } from '../billing/reconcile.ts';
+import { assessAssumptionFragility } from '../epistemic/countermodel.ts';
+import { reconciliationCountermodels } from '../billing/countermodels.ts';
+import { describeOffPathBound, displayUsd, signedUsd, type ReconciliationReadiness, type ReconciliationRun } from '../billing/reconcile.ts';
 import { reconciliationReadiness } from '../billing/readiness.ts';
 import { formatUsdMicros } from '../billing/types.ts';
 import { readBillingImportFile } from '../billing/importer.ts';
@@ -22,6 +24,7 @@ import { Store } from '../store/db.ts';
 import type { Flags } from './flags.ts';
 import { printJson } from './ui.ts';
 import { stringifyJson } from '../util/json.ts';
+import { moneyToJson } from '../economics/money.ts';
 
 function billingEgressRepairAction(failureCode: string): string | undefined {
   return failureCode === 'egress_receipt_integrity_failed' || failureCode === 'egress_receipt_persistence_failed'
@@ -116,6 +119,54 @@ function printReadiness(readiness: ReconciliationReadiness): void {
   console.log('  request a provider credential on your behalf. See docs/PROVIDER-RECONCILIATION.md.');
 }
 
+/**
+ * What each condition means if it does NOT hold (WP-B04).
+ *
+ * The conditions line above names five limits and stops there, which leaves the
+ * reader to work out for themselves what the world looks like when one fails and
+ * whether anything they have could tell them apart. Both answers exist and
+ * neither is obvious: four of them cannot be ruled out by any observation Fiscus
+ * can make, so the residual is PERMANENTLY conditional rather than pending a
+ * check someone could go and do — and one of them stops being hypothetical
+ * entirely when the residual goes negative.
+ *
+ * Deliberately compact. The full worlds are in `src/billing/countermodels.ts`
+ * and travel in `--json`; what an operator needs at the terminal is which
+ * conditions are closable, which are not, and whether one has already broken.
+ */
+function printFragility(result: ReconciliationRun): void {
+  const assessment = assessAssumptionFragility([...result.conditions], reconciliationCountermodels(result));
+  console.log('');
+  console.log('  If a condition does not hold');
+  // Broken first. A condition the evidence has already refuted is not one of
+  // several things that might be true, and an operator who reads no further
+  // than the first line of this block must still see it.
+  for (const model of assessment.realized) {
+    for (const line of wrapText(`${model.violates} is ESTABLISHED, not merely possible. ${model.claimBecomes}`, 70)) {
+      console.log(`    ! ${line}`);
+    }
+  }
+  if (assessment.unexcludable.length > 0) {
+    // Counts the established ones too, and should: a world the evidence has
+    // settled against the claim is by definition one nothing excluded.
+    const text = `${assessment.unexcludable.length} of ${assessment.assumptions.length} cannot be ruled out by anything `
+      + 'Fiscus can observe, so this residual is permanently conditional rather than pending a check.';
+    for (const line of wrapText(text, 72)) console.log(`    ${line}`);
+  }
+  for (const model of assessment.live) {
+    if (model.excludedBy === null) continue;
+    for (const line of wrapText(`${model.violates} can be closed by ${model.excludedBy}`, 70)) {
+      console.log(`    > ${line}`);
+    }
+  }
+  if (!assessment.robustnessAssessed) {
+    // Cannot happen while the worlds cover every permanent condition, and it is
+    // printed rather than asserted because the alternative is silence about a
+    // condition nobody examined.
+    console.log(`    ? no world recorded for: ${assessment.uncoveredAssumptions.join(', ')}`);
+  }
+}
+
 function printReconciliation(result: ReconciliationRun, applied: boolean): void {
   const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
   console.log('');
@@ -127,6 +178,13 @@ function printReconciliation(result: ReconciliationRun, applied: boolean): void 
   console.log(`  Provider reported   $${displayUsd(result.providerReportedMicros)}`);
   console.log(`  Fiscus metered      $${displayUsd(result.localCapturedMicros)}  (local rate-card estimate)`);
   console.log(`  Unexplained         ${signedUsd(result.unexplainedVarianceMicros)}`);
+  // The residual invites exactly one wrong reading — "near zero, so nothing
+  // went off-path" — and that reading is an absence inference the arithmetic
+  // does not license (AII-002). Say what it bounds, next to the number, before
+  // an operator acts on it.
+  for (const line of wrapText(describeOffPathBound(result.offPathBound), 74)) {
+    console.log(`    ${line}`);
+  }
   console.log('');
   console.log(`  Coverage      ${result.coverage.daysWithBoth} day(s) with both sides · ${result.coverage.providerOnlyDays} provider-only · ${result.coverage.localOnlyDays} local-only`);
   console.log(`  Material      ${result.coverage.materialDays} day(s) differ by more than $${result.materialityUsd.toFixed(2)}`);
@@ -152,6 +210,7 @@ function printReconciliation(result: ReconciliationRun, applied: boolean): void 
   }
   console.log(`  Provider side ${result.providerSourceKind.replaceAll('_', ' ')}`);
   console.log(`  Conditions    ${result.conditions.join(', ')}`);
+  printFragility(result);
   console.log(`  Excluded from ${result.excludedFrom.join(', ')}`);
   console.log(applied ? '  Recorded as an immutable derived run.' : '  Not recorded. Persist it with: fiscus billing reconcile --apply');
 }
@@ -187,8 +246,27 @@ function cmdReconcile(flags: Flags): void {
     }
     const applied = Boolean(flags.apply);
     const reconciliationRunId = applied ? store.saveReconciliationRun(result) : null;
-    if (flags.json) printJson({ applied, reconciliationRunId, result });
-    else printReconciliation(result, applied);
+    // A provider-day comparison with at least one provider day can cross the
+    // kernel only after the immutable run is recorded. Local-only periods have
+    // no provider Evidence and therefore remain a truthful non-claim.
+    const kernel = applied && reconciliationRunId !== null && result.coverage.providerDays > 0
+      ? store.issueOpenAiReconciliationToKernel(reconciliationRunId)
+      : null;
+    if (flags.json) {
+      printJson({
+        applied,
+        reconciliationRunId,
+        result,
+        kernel,
+        // The worlds in full, so a consumer parsing this does not have to
+        // reconstruct from the conditions list what the human output states.
+        fragility: assessAssumptionFragility([...result.conditions], reconciliationCountermodels(result)),
+      });
+    }
+    else {
+      printReconciliation(result, applied);
+      if (kernel) console.log(`  Canonical kernel: ${kernel.reconciliationClaim.result} mixed-basis Claim ${kernel.reconciliationClaim.id}.`);
+    }
   } finally {
     store.close();
   }
@@ -404,10 +482,18 @@ async function cmdOpenAiCosts(flags: Flags): Promise<void> {
         failureCode: null,
         observations: collected.observations,
       });
-      const payload = { applied: true, resultState: 'succeeded', run, observationCount: collected.observations.length };
+      // A complete provider snapshot with lines crosses the explicit kernel
+      // adapter. An empty but successful snapshot remains a valid empty
+      // observation and therefore has no Claim to issue.
+      const kernel = collected.observations.length > 0
+        ? store.issueOpenAiCostsObservationToKernel(run.observationRunId)
+        : null;
+      const kernelJson = kernel === null ? null : { ...kernel, total: { ...moneyToJson(kernel.total) } };
+      const payload = { applied: true, resultState: 'succeeded', run, observationCount: collected.observations.length, kernel: kernelJson };
       if (flags.json) printJson(payload);
       else {
         console.log(`  Recorded ${collected.observations.length} immutable OpenAI daily cost observation(s) in run ${run.observationRunId}.`);
+        if (kernel) console.log(`  Canonical kernel: ${kernel.observationEvidence.inserted} Evidence and ${kernel.observationClaims.inserted} provider-observed Claims issued; aggregate ${kernel.aggregateClaim.id}.`);
         console.log('  They remain unreconciled and are excluded from request spend, caps, RoI, and recommendations.');
       }
     } catch (error) {
@@ -672,6 +758,19 @@ function renderPreview(preview: ReturnType<typeof readBillingImportFile>['previe
   console.log('  No data written. Apply with: fiscus billing import --file <evidence.json> --apply');
 }
 
+/** Wrap a sentence to a column, so a condition is readable next to the number it qualifies. */
+function wrapText(text: string, width: number): string[] {
+  const lines: string[] = [];
+  let current = '';
+  for (const word of text.split(/\s+/)) {
+    if (current.length === 0) current = word;
+    else if (current.length + 1 + word.length <= width) current += ` ${word}`;
+    else { lines.push(current); current = word; }
+  }
+  if (current.length > 0) lines.push(current);
+  return lines;
+}
+
 /** `fiscus billing` — immutable local provider-cost evidence, never an implicit reconciliation. */
 export async function cmdBilling(flags: Flags): Promise<void> {
   const action = typeof flags._[0] === 'string' ? flags._[0] : 'status';
@@ -712,13 +811,25 @@ export async function cmdBilling(flags: Flags): Promise<void> {
       const store = new Store(dbPath());
       try {
         const result = store.applyBillingImport(parsed.input);
-        const payload = { applied: true, duplicateFile: result.duplicateFile, preview: parsed.preview, run: result.run };
+        // Keep the legacy provider-evidence tables as a compatibility read
+        // model, but issue the same accepted import through the canonical
+        // Evidence/Claim path before reporting success. A failed kernel issue
+        // is surfaced as a failed command; the immutable import remains safely
+        // resumable on retry.
+        const kernel = store.issueBillingImportToKernel(result.run.importId);
+        // Money carries a BigInt coefficient in-process. Convert only the CLI
+        // envelope to the canonical string coefficient so JSON never coerces or
+        // loses accounting precision.
+        const kernelJson = { ...kernel, total: { ...moneyToJson(kernel.total) } };
+        const payload = { applied: true, duplicateFile: result.duplicateFile, preview: parsed.preview, run: result.run, kernel: kernelJson };
         if (flags.json) {
           printJson(payload);
         } else if (result.duplicateFile) {
-          console.log(`  Identical billing evidence was already imported as ${result.run.importId}; no duplicate records written.`);
+          console.log(`  Identical billing evidence was already imported as ${result.run.importId}; no duplicate provider records written.`);
+          console.log(`  Canonical kernel replay: ${kernel.recordEvidence.duplicate} Evidence and ${kernel.recordClaims.duplicate} billed Claims already present.`);
         } else {
           console.log(`  Imported ${result.run.recordsInserted} provider-declared charge line(s); ${result.run.recordsDuplicate} already existed.`);
+          console.log(`  Canonical kernel: ${kernel.recordEvidence.inserted} Evidence and ${kernel.recordClaims.inserted} billed Claims issued; aggregate ${kernel.aggregateClaim.id}.`);
           console.log('  Status remains not_reconciled. Provider-reported totals are stored separately from local metered estimates.');
         }
       } finally {
