@@ -13,15 +13,18 @@
 import type { WorkUnit } from './realization.ts';
 import { computeReturnOnIntelligence, lensRedundancy, type LensRedundancy } from './lenses.ts';
 import { anytimeRateInterval } from './anytime.ts';
+import { economicAttributionFromAttributions, economicAttributionNumber, type EconomicAttribution } from '../economics/attribution.ts';
 
 export interface FrontierCell {
   key: string;
+  /** Provider paired with `model`; null means a legacy/unattributed snapshot. */
+  provider?: string | null;
   model: string | null;
   taskType: string | null;
   units: number;
   costUsd: number;
-  realizedValueUsd: number;
-  netRealizedValueUsd: number;
+  spendOnRealizedUnitsUsd: number;
+  acceptanceWeightedSpendUsd: number;
   realizationRate: number;
   acceptance: number | null;
   costPerUnit: number;
@@ -30,6 +33,12 @@ export interface FrontierCell {
   // production reach + durability) — kept so the cells double as the sample
   // for the lens-redundancy statistic below.
   impact: number | null;
+  /** Exact effective spend coverage; legacy numeric fields remain compatible projections. */
+  economic?: {
+    coverage: 'exact' | 'partial' | 'legacy_unknown';
+    total: EconomicAttribution | null;
+    realized: EconomicAttribution | null;
+  };
 }
 
 /**
@@ -39,6 +48,8 @@ export interface FrontierCell {
  */
 export interface ModelSwitchRecommendation {
   taskType: string;
+  incumbentProvider?: string | null;
+  candidateProvider?: string | null;
   incumbentModel: string;
   candidateModel: string;
   incumbentUnits: number;
@@ -52,12 +63,19 @@ export interface ModelSwitchRecommendation {
   historicalEquivalentHeadroomUsd: number;
   historicalHeadroomPercent: number;
   /**
-   * `evidence_supported` requires the anytime-valid bounds to separate AND the
-   * separation to survive one outcome flipping the wrong way on each side.
-   * Everything else — overlapping bounds, or a separation that hinges on a single
-   * observation — is a `trial`.
+   * What the OBSERVATIONAL procedure returned — never a treatment effect.
+   *
+   * `observational_separation` means the anytime-valid bounds separated AND the
+   * separation survived one outcome flipping the wrong way on each side, with no
+   * named confounder. Everything else — overlapping bounds, a separation that
+   * hinges on a single observation, or any named confounder — is a `trial`.
+   *
+   * Neither value is causal evidence. Models are not assigned; which model ran on
+   * which unit was chosen by whoever was working, so a separation here is a
+   * property of the observed comparison, not of the models. A causal claim about
+   * switching requires the randomized lane in `src/causal/`.
    */
-  confidence: 'trial' | 'evidence_supported';
+  confidence: 'trial' | 'observational_separation';
   /**
    * How the per-unit costs above were priced. `dominant_model_attributed` means
    * each model was charged only its own spend in the unit's window — a local
@@ -134,34 +152,60 @@ export interface FrontierReport {
 
 function makeCell(key: string, model: string | null, taskType: string | null, units: WorkUnit[]): FrontierCell {
   const realized = units.filter((u) => u.funnel.realized);
-  const costUsd = units.reduce((s, u) => s + u.attributedCostUsd, 0);
-  const realizedValueUsd = realized.reduce((s, u) => s + u.attributedCostUsd, 0);
+  const providers = new Set(units.map((u) => u.dominantProvider ?? null));
+  const provider = providers.size === 1 ? [...providers][0] ?? null : null;
+  const costUsd = units.reduce((s, u) => s + economicAttributionNumber(u.economic, u.attributedCostUsd), 0);
+  const spendOnRealizedUnitsUsd = realized.reduce((s, u) => s + economicAttributionNumber(u.economic, u.attributedCostUsd), 0);
   // Net of rework: discount each realized unit's value by its first-pass acceptance
   // (unknown acceptance → full credit), matching the headline's net efficiency so
   // the frontier + allocation rank contexts by the SAME value the Index rewards.
-  const netRealizedValueUsd = realized.reduce((s, u) => s + u.attributedCostUsd * (u.acceptance ?? 1), 0);
+  const acceptanceWeightedSpendUsd = realized.reduce((s, u) => s + economicAttributionNumber(u.economic, u.attributedCostUsd) * (u.acceptance ?? 1), 0);
   const withAcc = units.filter((u) => u.acceptance !== null);
   const acceptance = withAcc.length > 0 ? withAcc.reduce((s, u) => s + (u.acceptance ?? 0), 0) / withAcc.length : null;
   const realizationRate = units.length > 0 ? realized.length / units.length : 0;
   const roi = computeReturnOnIntelligence({
     firstPassAcceptance: acceptance,
     units,
-    matured: { realizationRate, totalCostUsd: costUsd, realizedValueUsd, netRealizedValueUsd },
+    matured: { realizationRate, totalCostUsd: costUsd, spendOnRealizedUnitsUsd, acceptanceWeightedSpendUsd },
   });
+  const exactValues = units.flatMap((unit) => unit.economic === undefined ? [] : [unit.economic]);
+  const realizedExactValues = realized.flatMap((unit) => unit.economic === undefined ? [] : [unit.economic]);
+  const economic = exactValues.length === 0
+    ? { coverage: 'legacy_unknown' as const, total: null, realized: null }
+    : {
+        coverage: exactValues.length === units.length && economicAttributionFromAttributions(exactValues).complete ? 'exact' as const : 'partial' as const,
+        total: economicAttributionFromAttributions(exactValues),
+        realized: economicAttributionFromAttributions(realizedExactValues),
+      };
   return {
     key,
+    provider,
     model,
     taskType,
     units: units.length,
     costUsd,
-    realizedValueUsd,
-    netRealizedValueUsd,
+    spendOnRealizedUnitsUsd,
+    acceptanceWeightedSpendUsd,
     realizationRate,
     acceptance,
     costPerUnit: units.length > 0 ? costUsd / units.length : 0,
     roiIndex: roi.roiIndex,
     impact: roi.lenses.impact.value,
+    economic,
   };
+}
+
+/** Provider/model identity used for every consequential frontier comparison. */
+function modelIdentity(u: WorkUnit): string {
+  if (u.dominantModel === null) return 'unattributed';
+  return `${u.dominantProvider ?? ''}\u0000${u.dominantModel}`;
+}
+
+function modelIdentityParts(identity: string): { provider: string | null; model: string | null } {
+  if (identity === 'unattributed') return { provider: null, model: null };
+  const separator = identity.indexOf('\u0000');
+  if (separator < 0) return { provider: null, model: identity };
+  return { provider: identity.slice(0, separator) || null, model: identity.slice(separator + 1) || null };
 }
 
 function groupBy<K>(units: WorkUnit[], keyFn: (u: WorkUnit) => K): Map<K, WorkUnit[]> {
@@ -179,8 +223,9 @@ export function computeFrontier(units: WorkUnit[]): FrontierReport {
   const mature = units.filter((u) => !u.maturing);
 
   const byModel: FrontierCell[] = [];
-  for (const [model, us] of groupBy(mature, (u) => u.dominantModel ?? 'unattributed')) {
-    byModel.push(makeCell(model, model, null, us));
+  for (const [identity, us] of groupBy(mature, modelIdentity)) {
+    const parts = modelIdentityParts(identity);
+    byModel.push(makeCell(parts.provider ? `${parts.provider} · ${parts.model}` : (parts.model ?? 'unattributed'), parts.model, null, us));
   }
   byModel.sort(byRoiDesc);
 
@@ -192,8 +237,9 @@ export function computeFrontier(units: WorkUnit[]): FrontierReport {
 
   const byModelAndTask: FrontierCell[] = [];
   for (const [tt, tus] of groupBy(mature, (u) => u.taskType)) {
-    for (const [model, us] of groupBy(tus, (u) => u.dominantModel ?? 'unattributed')) {
-      byModelAndTask.push(makeCell(`${tt} · ${model}`, model, tt, us));
+    for (const [identity, us] of groupBy(tus, modelIdentity)) {
+      const parts = modelIdentityParts(identity);
+      byModelAndTask.push(makeCell(`${tt} · ${parts.provider ? `${parts.provider} · ` : ''}${parts.model ?? 'unattributed'}`, parts.model, tt, us));
     }
   }
   byModelAndTask.sort(byRoiDesc);
@@ -249,6 +295,8 @@ function isPriceable(u: WorkUnit): boolean {
 
 /** A model-vs-model cell priced by the model's OWN spend, not the window total. */
 interface SwitchCell {
+  identity: string;
+  provider: string | null;
   model: string;
   units: number;
   /** Realized-outcome count — kept as a raw count so the interval math never round-trips through a rate. */
@@ -328,12 +376,16 @@ function lineageValues(units: WorkUnit[], pick: (u: WorkUnit) => string | null):
   return [...out].sort();
 }
 
-function makeSwitchCell(model: string, units: WorkUnit[]): SwitchCell {
-  const modelCostUsd = units.reduce((s, u) => s + (u.dominantModelCostUsd ?? 0), 0);
+function makeSwitchCell(identity: string, units: WorkUnit[]): SwitchCell {
+  const parts = modelIdentityParts(identity);
+  const model = parts.model ?? 'unattributed';
+  const modelCostUsd = units.reduce((s, u) => s + economicAttributionNumber(u.dominantModelEconomic, u.dominantModelCostUsd ?? 0), 0);
   const realized = units.filter((u) => u.funnel.realized).length;
   const times = units.map((u) => u.tsEpochMs);
   const totalLines = units.reduce((s, u) => s + u.linesAdded + u.linesDeleted, 0);
   return {
+    identity,
+    provider: parts.provider,
     model,
     units: units.length,
     realized,
@@ -388,7 +440,7 @@ function buildModelSwitchRecommendations(mature: WorkUnit[]): ModelSwitchRecomme
   const eligibleComparisons = Math.max(
     1,
     taskGroups.reduce((total, [, units]) => {
-      const models = new Set(units.filter(isPriceable).map((u) => u.dominantModel ?? 'unattributed'));
+      const models = new Set(units.filter(isPriceable).map(modelIdentity));
       models.delete('unattributed');
       return total + (models.size >= 2 ? models.size - 1 : 0);
     }, 0),
@@ -412,8 +464,8 @@ function buildModelSwitchRecommendations(mature: WorkUnit[]): ModelSwitchRecomme
     );
     const attributable = priced.filter(isPriceable);
 
-    const cells = [...groupBy(attributable, (u) => u.dominantModel ?? 'unattributed')]
-      .map(([model, grouped]) => makeSwitchCell(model, grouped))
+    const cells = [...groupBy(attributable, modelIdentity)]
+      .map(([identity, grouped]) => makeSwitchCell(identity, grouped))
       .filter((cell) => cell.units >= minUnits && cell.model !== 'unattributed' && cell.costPerUnit > 0);
     if (cells.length < 2) continue;
 
@@ -421,7 +473,7 @@ function buildModelSwitchRecommendations(mature: WorkUnit[]): ModelSwitchRecomme
     const candidate = cells
       .filter(
         (cell) =>
-          cell.model !== incumbent.model &&
+          cell.identity !== incumbent.identity &&
           cell.costPerUnit < incumbent.costPerUnit &&
           cell.realizationRate >= incumbent.realizationRate,
       )
@@ -531,7 +583,7 @@ function buildModelSwitchRecommendations(mature: WorkUnit[]): ModelSwitchRecomme
       );
     }
 
-    const confidence = separates && survivesOneFlip && confounders.length === 0 ? 'evidence_supported' : 'trial';
+    const confidence = separates && survivesOneFlip && confounders.length === 0 ? 'observational_separation' : 'trial';
     const savingsPerUnitUsd = incumbent.costPerUnit - candidate.costPerUnit;
     const historicalEquivalentHeadroomUsd = savingsPerUnitUsd * incumbent.units;
     // Percent of the incumbent MODEL's own attributed spend — the same basis the
@@ -541,8 +593,8 @@ function buildModelSwitchRecommendations(mature: WorkUnit[]): ModelSwitchRecomme
     // A trial now arises two different ways, and saying "the intervals overlap"
     // when they in fact separated would be a false rationale.
     const confidenceText =
-      confidence === 'evidence_supported'
-        ? "the candidate's anytime-valid lower outcome bound exceeds the incumbent's upper bound, and still does if one outcome flips either way"
+      confidence === 'observational_separation'
+        ? "the candidate's anytime-valid lower outcome bound exceeds the incumbent's upper bound under the observational procedure, and still does if one outcome flips either way; models were not assigned, so this is a separation, not a treatment effect"
         : confounders.length > 0
           ? `the comparison is confounded — ${confounders[0]}`
           : separates
@@ -551,6 +603,8 @@ function buildModelSwitchRecommendations(mature: WorkUnit[]): ModelSwitchRecomme
 
     recs.push({
       taskType,
+      incumbentProvider: incumbent.provider,
+      candidateProvider: candidate.provider,
       incumbentModel: incumbent.model!,
       candidateModel: candidate.model!,
       incumbentUnits: incumbent.units,
@@ -593,8 +647,8 @@ function buildModelSwitchStrings(switches: ModelSwitchRecommendation[]): string[
   }
   return switches.map((item) => {
     const confidence =
-      item.confidence === 'evidence_supported'
-        ? 'evidence-supported comparison'
+      item.confidence === 'observational_separation'
+        ? 'observational separation, not a causal effect'
         : 'review-only trial; continue measuring before changing a default';
     // A confounder is the single most decision-relevant thing about the result —
     // it is why the number may not be about the model at all — so it goes in the

@@ -9,11 +9,14 @@ import { Store } from '../store/db.ts';
 import { loadConfig, saveConfig, dbPath, configPath, fiscusHome, isDemo, type FiscusConfig } from '../config.ts';
 import { startOfLocalDay } from '../budget/guard.ts';
 import { requestsToCsv } from '../export/csv.ts';
+import { economicRequestsToCsv, economicRequestsToJson } from '../export/economic.ts';
 import { computeAlerts } from '../alerts/detect.ts';
 import { describeSourceDepth } from '../value/sourceDepth.ts';
 import { isDeclaredAttribution } from '../value/characterization.ts';
-import { C, color, usd, num, pct } from './ui.ts';
+import { C, color, usd, num, pct, printJson } from './ui.ts';
+import { stringifyJson } from '../util/json.ts';
 import { rangeFor, type Flags } from './flags.ts';
+import { instant, type Instant } from '../epistemic/time.ts';
 
 export function cmdShow(window: 'today' | 'week' | 'month', flags: Flags): void {
   const cfg = loadConfig();
@@ -26,7 +29,7 @@ export function cmdShow(window: 'today' | 'week' | 'month', flags: Flags): void 
   const bySource = store.bySource(startMs, endMs);
 
   if (flags.json) {
-    process.stdout.write(JSON.stringify({ window, label, demo: isDemo(), summary, byModel, byProject, byUser, bySource }, null, 2) + '\n');
+    printJson({ window, label, demo: isDemo(), summary, byModel, byProject, byUser, bySource });
     store.close();
     return;
   }
@@ -132,7 +135,7 @@ export function cmdSources(flags: Flags): void {
 
   if (flags.json) {
     const enriched = bySource.map((s) => ({ ...s, models: modelsBySource.get(s.label) ?? [] }));
-    process.stdout.write(JSON.stringify({ window: all ? 'all' : '30d', demo: isDemo(), bySource: enriched }, null, 2) + '\n');
+    printJson({ window: all ? 'all' : '30d', demo: isDemo(), bySource: enriched });
     store.close();
     return;
   }
@@ -171,19 +174,55 @@ export function cmdSources(flags: Flags): void {
 }
 
 export function cmdExport(flags: Flags): void {
+  const rawTargetUnit = flags['target-currency'];
+  const targetUnit = rawTargetUnit === undefined
+    ? undefined
+    : (typeof rawTargetUnit === 'string' && rawTargetUnit.trim().length > 0
+      ? rawTargetUnit.trim()
+      : (() => { throw new Error('--target-currency must be a non-empty currency/unit'); })());
+  const rawAsOf = flags['as-of'];
+  const asOf = rawAsOf === undefined
+    ? undefined
+    : (typeof rawAsOf === 'string'
+      ? instant(rawAsOf)
+      : (() => { throw new Error('--as-of must be a canonical UTC ISO-8601 instant'); })());
+  const rawEffectiveAt = flags['effective-at'];
+  const effectiveAt: Instant | undefined = rawEffectiveAt === undefined
+    ? undefined
+    : (typeof rawEffectiveAt === 'string'
+      ? instant(rawEffectiveAt)
+      : (() => { throw new Error('--effective-at must be a canonical UTC ISO-8601 instant'); })());
+  if (effectiveAt !== undefined && targetUnit === undefined) {
+    throw new Error('--effective-at requires --target-currency');
+  }
+  const all = flags.all === true;
+  const rawDays = flags.days;
+  const days = rawDays === undefined
+    ? 30
+    : (typeof rawDays === 'string' && rawDays.trim().length > 0 ? Number(rawDays) : NaN);
+  if (!all && (!Number.isFinite(days) || days <= 0 || days > 3650)) {
+    throw new Error('--days must be a finite number between 0 and 3650 (or pass --all)');
+  }
   const store = new Store(dbPath());
   const now = Date.now();
   const dayMs = 24 * 60 * 60 * 1000;
-  const days = flags.days ? Number(flags.days) : 30;
-  const startMs = flags.all ? 0 : now - days * dayMs;
+  const startMs = all ? 0 : now - days * dayMs;
+  const economic = flags.economic === true || flags['exact-money'] === true || targetUnit !== undefined || asOf !== undefined;
   const rows = store.requestsInRange(startMs, now + 1000);
+  const economicRows = economic ? store.economicRequestsInRange(startMs, now + 1000, {
+    ...(targetUnit === undefined ? {} : { targetUnit }),
+    ...(asOf === undefined ? {} : { asOf }),
+    ...(effectiveAt === undefined ? {} : { effectiveAt }),
+  }) : null;
   const asJson = flags.json === true || flags.format === 'json';
-  const out = asJson ? JSON.stringify(rows, null, 2) + '\n' : requestsToCsv(rows);
+  const out = economic
+    ? (asJson ? economicRequestsToJson(economicRows!) : economicRequestsToCsv(economicRows!))
+    : (asJson ? `${stringifyJson(rows)}\n` : requestsToCsv(rows));
 
   if (typeof flags.out === 'string') {
     writeFileSync(flags.out, out);
     const tty = process.stdout.isTTY ?? false;
-    console.error(color(tty, C.green, `  Exported ${num(rows.length)} requests (${asJson ? 'json' : 'csv'}) → ${flags.out}`));
+    console.error(color(tty, C.green, `  Exported ${num(rows.length)} requests (${economic ? 'economic-' : ''}${asJson ? 'json' : 'csv'}) → ${flags.out}`));
   } else {
     process.stdout.write(out);
   }
@@ -193,7 +232,7 @@ export function cmdExport(flags: Flags): void {
 export function cmdConfig(flags: Flags): void {
   const cfg = loadConfig();
   if (flags.json) {
-    process.stdout.write(JSON.stringify({ home: fiscusHome(), configPath: configPath(), dbPath: dbPath(), config: cfg }, null, 2) + '\n');
+    printJson({ home: fiscusHome(), configPath: configPath(), dbPath: dbPath(), config: cfg });
     return;
   }
   console.log('');
@@ -201,7 +240,7 @@ export function cmdConfig(flags: Flags): void {
   console.log(`  Config: ${configPath()}`);
   console.log(`  DB:     ${dbPath()}`);
   console.log('');
-  console.log(JSON.stringify(cfg, null, 2));
+  console.log(stringifyJson(cfg));
   console.log('');
 }
 
@@ -314,7 +353,7 @@ export function cmdProject(flags: Flags): void {
       const demoNote = 'DEMO DATA: these bases are DEPICTED by the seed, not observed. '
         + 'The coverage share below describes a scenario, not this machine.';
       if (flags.json) {
-        process.stdout.write(JSON.stringify({
+        printJson({
           window: { startMs: 0, endMs, label: 'all recorded time' },
           demo: isDemo(),
           total: { costUsd: total, declaredCostUsd: declared },
@@ -323,7 +362,7 @@ export function cmdProject(flags: Flags): void {
             'How each project label was obtained. A declared label is a self-assertion by the calling tool, '
             + 'never a verified identity, and this is not chargeback-grade attribution.'
             + (isDemo() ? ` ${demoNote}` : ''),
-        }, null, 2) + '\n');
+        });
         return;
       }
       console.log('');
@@ -349,7 +388,7 @@ export function cmdProject(flags: Flags): void {
     const byProject = store.byProject(0, Date.now() + 1000);
     const aliases = store.listProjectAliases();
     if (flags.json) {
-      process.stdout.write(JSON.stringify({ projects: byProject, aliases }, null, 2) + '\n');
+      printJson({ projects: byProject, aliases });
       return;
     }
     console.log('');

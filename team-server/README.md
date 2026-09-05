@@ -60,7 +60,7 @@ Environment variables:
 | `TEAM_SERVER_EXPOSE_DEVELOPER_BREAKDOWN` | no (default off) | Set to exactly `true` to turn on `GET /dashboard/developers`. Off by default — opt-in, same fail-closed posture as `TEAM_SERVER_ADMIN_TOKEN`. |
 | `TEAM_SERVER_MIN_COHORT` | no (default `5`) | The k-anonymity floor: `/dashboard/projects` withholds any single project's numbers if fewer than this many distinct developers contributed to it, and `/dashboard/developers` withholds its whole distribution below this many total developers. Same default `cohort.ts` already uses for the single-machine per-user value feature. |
 | `PORT` | no (default `8092`) | Listen port. |
-| `HOST` | no (default `0.0.0.0`) | Listen address. Unlike Fiscus's own local dashboard, this server is *meant* to be reached across your network. |
+| `HOST` | no (default `127.0.0.1`) | Listen address. Loopback is the safe default; set this explicitly only behind the separately verified TLS/OIDC/Postgres deployment gate. |
 
 ### Dashboard aggregate authorization
 
@@ -82,7 +82,11 @@ infer group membership or generic roles from provider-specific claims. `GET
 This process speaks plain HTTP. Put a reverse proxy (nginx, Caddy, your cloud
 load balancer) in front of it for TLS — that's your infrastructure's job, not
 this process's; see `docs/TEAM-TIER-DESIGN.md` §1's "Fiscus provides the
-software, never the operation" framing.
+software, never the operation" framing. OIDC discovery/JWKS retrieval is
+HTTPS-only except for literal loopback test endpoints, follows no redirects,
+limits response bodies, and requires discovered JWKS to remain on the issuer
+origin. An explicitly configured HTTPS `OIDC_JWKS_URL` is the pin for providers
+that intentionally publish keys on another origin.
 
 ## Registering a developer
 
@@ -202,13 +206,22 @@ logic without a live database (`test/fakeStore.ts` stands in for Postgres,
 implementing the exact same weighting semantics as the real SQL — see its
 header comment) and without a real SSO provider (`test/fakeIdp.ts` runs a real
 local OIDC-shaped server, signing tokens with genuine RS256/ES256 keypairs, so
-`oidc.ts` is proven against real signatures, not just assumed to work). 48
+`oidc.ts` is proven against real signatures, not just assumed to work). 61
 tests total: `test/aggregate.test.ts` covers the privacy-gating logic in
 isolation (k-anonymity boundaries, the opt-in gate, the $0-cost rate-exclusion
 edge case), and `test/server.test.ts`'s dashboard tests push hand-computed
 rollups through the real HTTP layer and assert exact expected numbers — chosen
 specifically so a naive (unweighted) average would produce a *different*,
 wrong answer, not just an untested one.
+
+The server accepts the additive team-rollup v2 protocol as well as v1. A v2
+project carries a canonical exact effective/source attribution object; the
+server validates that object after signature verification, retains the signed
+body in `rollups.body`, and stores the same project lineage in the nullable
+`rollup_projects.economic_json` JSONB column. The existing numeric columns stay
+as compatibility aggregates for older clients and dashboards. This proves
+protocol and semantic validation in the fake-store HTTP suite, not provider
+authority, causal truth, or execution against a live Postgres instance.
 
 It does not exercise `schema.sql` or the real SQL in `src/store.ts`'s
 `PgRollupStore` (including the two new aggregate queries) against an actual

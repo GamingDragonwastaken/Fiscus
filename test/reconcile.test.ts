@@ -19,11 +19,14 @@ import {
   isOnDeclaredRoute,
   displayUsd,
   signedUsd,
+  offPathBoundFromResidual,
+  describeOffPathBound,
   SETTLEMENT_LAG_MS,
   DEFAULT_MATERIALITY_USD,
   type ReconciliationRun,
 } from '../src/billing/reconcile.ts';
 import { Store, type OpenAiCostsObservationLine, type OpenAiCostsObservationRun, type RequestRow } from '../src/store/db.ts';
+import { money } from '../src/economics/money.ts';
 
 const DAY = 24 * 60 * 60 * 1000;
 // A fixed, long-past UTC day so the settlement-lag guard never depends on when
@@ -121,6 +124,29 @@ test('reconcile: compares project-day totals and states the residual rather than
   // Never plain "reconciled".
   assert.equal(result.status, 'reconciled_with_residual');
   assert.equal(result.trust, 'scope_conditional_reconciliation');
+});
+
+test('reconcile: uses exact local Money and refuses implicit sub-microdollar quantization', () => {
+  const exact = reconcileOpenAiCosts({
+    run: run(),
+    observations: [line(0, '2')],
+    // Deliberately disagreeing compatibility projection: exact economic data is
+    // authoritative when it is present on the row.
+    requests: [req(0, 999, { economicAmount: money('2', 'USD', 'estimated') })],
+    now: NOW,
+  });
+  assert.equal(exact?.status, 'reconciled_with_residual');
+  assert.equal(exact?.status === 'reconciled_with_residual' && exact.localCapturedMicros, 2_000_000);
+  assert.equal(exact?.status === 'reconciled_with_residual' && exact.unexplainedVarianceMicros, 0);
+
+  const subMicro = reconcileOpenAiCosts({
+    run: run(),
+    observations: [line(0, '0')],
+    requests: [req(0, 0, { economicAmount: money('0.0000001', 'USD', 'estimated') })],
+    now: NOW,
+  });
+  assert.equal(subMicro?.status, 'refused');
+  assert.equal(subMicro?.status === 'refused' && subMicro.refusal, 'local_exact_amount_requires_explicit_quantization');
 });
 
 test('reconcile: a day the provider reports and Fiscus never saw is named, not averaged away', () => {
@@ -345,6 +371,42 @@ test('reconcile: the store path picks the newest snapshot and finds the independ
   store.close();
 });
 
+test('reconcile: the store path preserves exact local amounts before the microdollar boundary', () => {
+  const store = new Store(':memory:');
+  const scope = store.setOpenAiScope({
+    billingAccountRef: 'org_exact',
+    providerProjectRef: 'proj_exact',
+    upstreamBase: 'https://api.openai.com',
+  });
+  store.recordOpenAiCostsObservation({
+    declaredScopeId: scope.declarationId,
+    providerProjectRef: 'proj_exact',
+    periodStartMs: D0,
+    periodEndMs: D0 + DAY,
+    fetchedAtMs: D0 + 2 * DAY,
+    paginationComplete: true,
+    pageCount: 1,
+    pageDigestChainSha256: 'c'.repeat(64),
+    resultState: 'succeeded',
+    failureCode: null,
+    observations: [
+      { providerProjectRef: 'proj_exact', bucketStartMs: D0, bucketEndMs: D0 + DAY, lineItem: 'gpt-4o', currency: 'USD', amountDecimal: '2' },
+    ],
+  });
+  store.insertRequest(req(0, 2.0000001, {
+    economicAmount: money('2.0000001', 'USD', 'estimated'),
+    providerScopeDeclarationId: scope.declarationId,
+  }));
+
+  const result = store.reconcileOpenAiCosts({ now: NOW });
+  assert.equal(result?.status, 'refused');
+  assert.equal(
+    result?.status === 'refused' && result.refusal,
+    'local_exact_amount_requires_explicit_quantization',
+  );
+  store.close();
+});
+
 test('reconcile: the store round-trips a run immutably and reports no reconciliation without one', () => {
   const store = new Store(':memory:');
   // Nothing observed yet: the store must say so rather than invent an empty run.
@@ -364,4 +426,46 @@ test('reconcile: the store round-trips a run immutably and reports no reconcilia
   store.saveReconciliationRun(result, NOW + 1000);
   assert.equal(store.reconciliationRuns().length, 2);
   store.close();
+});
+
+// ---------------------------------------------------------------------------
+// What the residual bounds, and when it bounds nothing (AII-002).
+// ---------------------------------------------------------------------------
+
+test('a residual bounds off-path spend only while the local estimate stays under the provider total', () => {
+  // Write P for the provider total, L for what Fiscus metered, T for the true
+  // billed cost of on-path traffic and O for off-path. P = T + O, so the
+  // residual R = P - L = O + (T - L), and `O <= R` holds exactly when L <= T.
+  assert.equal(offPathBoundFromResidual(1_334_567, 1_000_000), 'upper_bound_conditional');
+  assert.equal(offPathBoundFromResidual(1_000_000, 1_000_000), 'upper_bound_conditional');
+
+  // R < 0 says L > P = T + O >= T, which refutes L <= T outright. No upper
+  // bound survives: local over-estimation has absorbed an unknown amount of
+  // off-path spend — and a small or negative number invites exactly the
+  // opposite conclusion.
+  assert.equal(offPathBoundFromResidual(900_000, 1_000_000), 'none_local_estimate_exceeds_provider');
+});
+
+test('each bound state says what it licenses, and neither claims off-path spend was measured', () => {
+  const bounded = describeOffPathBound('upper_bound_conditional');
+  const unbounded = describeOffPathBound('none_local_estimate_exceeds_provider');
+
+  assert.match(bounded, /upper bound/i);
+  assert.match(bounded, /conditional/i);
+  assert.match(bounded, /not a measurement/i);
+
+  assert.match(unbounded, /no upper bound/i);
+  assert.match(unbounded, /not evidence that nothing went off-path/i);
+  // A reader shown the wrong one draws exactly the wrong conclusion.
+  assert.notEqual(bounded, unbounded);
+});
+
+test('a real reconciliation carries the bound state, and it tracks the totals', () => {
+  // Non-vacuous: the field must come from the run rather than being a constant.
+  assert.equal(
+    offPathBoundFromResidual(0, 1),
+    'none_local_estimate_exceeds_provider',
+    'one micro of over-estimate is already enough to lose the bound',
+  );
+  assert.equal(offPathBoundFromResidual(1, 0), 'upper_bound_conditional');
 });

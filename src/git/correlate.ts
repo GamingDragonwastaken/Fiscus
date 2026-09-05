@@ -18,6 +18,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { Store } from '../store/db.ts';
 import { projectKey } from '../value/characterization.ts';
+import { economicAttributionFromRows, economicAttributionNumber, type EconomicAttribution } from '../economics/attribution.ts';
 
 const run = promisify(execFile);
 
@@ -33,6 +34,8 @@ export interface CommitInfo {
 export interface CommitAttribution extends CommitInfo {
   windowStartMs: number;
   windowEndMs: number;
+  /** Exact effective economic coverage for this attribution window. */
+  economic?: EconomicAttribution;
   attributedCostUsd: number;
   attributedRequests: number;
   attributedOutputTokens: number;
@@ -185,14 +188,19 @@ export async function attributeCommits(
     // project's concurrent traffic. Undefined scope = the project-blind window sum
     // (proxy default), preserving the original behavior.
     const spend = store.summary(windowStartMs, windowEndMs, opts.scopeProject);
+    const economicRows = store.economicRequestRowsInRange(windowStartMs, windowEndMs, {
+      project: opts.scopeProject,
+    });
+    const economic = economicAttributionFromRows(economicRows);
     const totalLines = commit.linesAdded + commit.linesDeleted;
-    const costPerHundredLines = totalLines > 0 ? (spend.costUsd / totalLines) * 100 : null;
-
+    const attributedCostUsd = economicAttributionNumber(economic, spend.costUsd);
+    const costPerHundredLines = totalLines > 0 ? (attributedCostUsd / totalLines) * 100 : null;
     const attribution: CommitAttribution = {
       ...commit,
       windowStartMs,
       windowEndMs,
-      attributedCostUsd: spend.costUsd,
+      economic,
+      attributedCostUsd,
       attributedRequests: spend.requests,
       attributedOutputTokens: spend.outputTokens,
       costPerHundredLines,
@@ -213,7 +221,7 @@ export async function attributeCommits(
         commitHash: commit.hash,
         windowStartMs,
         windowEndMs,
-        attributedCostUsd: spend.costUsd,
+        attributedCostUsd,
         attributedRequests: spend.requests,
         attributedOutputTokens: spend.outputTokens,
       });

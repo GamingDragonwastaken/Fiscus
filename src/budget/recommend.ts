@@ -1,12 +1,25 @@
 /**
- * Value-aware budget recommendations.
+ * Value-aware budget SCENARIOS — a heuristic advisor, not an optimizer.
  *
- * The original budget caps are blunt dollar ceilings. This derives *accurate*
- * budgets from two things measurement now gives us:
- *   1. What you actually spend (so the cap fits real usage, not a guess).
- *   2. What that spend actually returns (so a low realized-value rate tightens
- *      the cap and surfaces projected waste — and the frontier says where to
- *      reallocate).
+ * The original budget caps are blunt dollar ceilings. This proposes a better-
+ * fitting one from two things measurement gives us:
+ *   1. What you actually spend (so the cap fits observed usage, not a guess).
+ *   2. What share of that spend reached a realized outcome (so a low rate
+ *      tightens the cap and surfaces projected waste — and the frontier says
+ *      where an operator might look to reallocate).
+ *
+ * WHAT THIS IS NOT (AII-026). It is not an optimization: no objective is stated,
+ * no constraint set is solved, and no alternative cap is evaluated against one.
+ * The headroom multiplier and the realized-rate tightening are disclosed
+ * heuristics chosen for plausibility, not derived from a utility model. The
+ * realized-value RATE it consumes is a lifecycle share of attributed spend, not
+ * evidence that the spend caused the outcome, so "projected waste" is a
+ * scenario under that share continuing — not a forecast and not a saving.
+ *
+ * A cap that materially changes behaviour is a decision, and decisions belong to
+ * `src/decision/engine.ts` and the assurance chain above it. Until a proposal
+ * carries a DecisionCertificate, this output stays advisory: it is rendered for
+ * review, and `canApply` gates whether an operator may even act on it.
  *
  * Pure function over precomputed inputs, so it is testable without a store.
  */
@@ -15,7 +28,7 @@ import type { FrontierCell } from '../value/frontier.ts';
 
 export interface BudgetInputs {
   dailySpends: number[]; // recent per-day spend totals (USD)
-  realizedValueRate: number | null; // share of spend that realized (0..1)
+  realizedSpendShare: number | null; // share of attributed SPEND that reached a kept outcome (0..1) — not a value rate
   frontier?: FrontierCell[]; // byModelAndTask cells, for reallocation hints
 }
 
@@ -37,7 +50,7 @@ export interface BudgetRecommendation {
   observed: { medianDaily: number; p90Daily: number; maxDaily: number; avgDaily: number };
   recommendedDailyUsd: number | null; // null = not enough spend history to recommend a cap
   recommendedSoftUsd: number | null;
-  realizedValueRate: number | null;
+  realizedSpendShare: number | null;
   projectedMonthlyWasteUsd: number | null;
   rationale: string[];
   reallocations: Reallocation[];
@@ -69,7 +82,7 @@ export function recommendBudget(
   const spends = inp.dailySpends.filter((x) => x > 0);
   const headroom = opts.headroom ?? 1.2;
   const minActiveDays = opts.minActiveDays ?? 7;
-  const rvr = inp.realizedValueRate;
+  const rvr = inp.realizedSpendShare;
 
   // Cold start: nothing real to base a cap on. Say so instead of recommending $0.
   if (spends.length === 0) {
@@ -81,7 +94,7 @@ export function recommendBudget(
       observed: { medianDaily: 0, p90Daily: 0, maxDaily: 0, avgDaily: 0 },
       recommendedDailyUsd: null,
       recommendedSoftUsd: null,
-      realizedValueRate: rvr,
+      realizedSpendShare: rvr,
       projectedMonthlyWasteUsd: null,
       rationale: ['Not enough spend history yet — keep metering. A value-aware cap appears once there are a few active days of real usage.'],
       reallocations: [],
@@ -97,7 +110,7 @@ export function recommendBudget(
       observed: { medianDaily: 0, p90Daily: 0, maxDaily: 0, avgDaily: 0 },
       recommendedDailyUsd: null,
       recommendedSoftUsd: null,
-      realizedValueRate: rvr,
+      realizedSpendShare: rvr,
       projectedMonthlyWasteUsd: null,
       rationale: [
         `Only ${spends.length} active day${spends.length === 1 ? '' : 's'} of real spend observed; keep metering until at least ${minActiveDays} active days exist before applying a cap.`,
@@ -174,7 +187,7 @@ export function recommendBudget(
     observed: { medianDaily, p90Daily, maxDaily, avgDaily },
     recommendedDailyUsd,
     recommendedSoftUsd,
-    realizedValueRate: rvr,
+    realizedSpendShare: rvr,
     projectedMonthlyWasteUsd,
     rationale,
     reallocations,

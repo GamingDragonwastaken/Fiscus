@@ -10,6 +10,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Store } from '../store/db.ts';
 import { loadConfig, dbPath, fiscusHome } from '../config.ts';
+import { discardResponseBody, egressFetch, EgressError, type EgressErrorCode } from '../egress/transport.ts';
 import { isGitRepo, projectName } from '../git/correlate.ts';
 import {
   computeRealization,
@@ -22,16 +23,18 @@ import { computeCohort, userValueRows, selfView } from '../value/cohort.ts';
 import {
   loadOrCreateKeyPair,
   buildReceiptBody,
+  buildEconomicReceiptBody,
   signReceipt,
   verifyReceipt,
   type SignedReceipt,
   type VerifyOptions,
   type KeyPair,
 } from '../value/receipt.ts';
-import { buildRollupBody, signRollup, type SignedRollup } from '../team/rollup.ts';
+import { buildEconomicRollupBody, buildRollupBody, signRollup, type EconomicProjectValue, type SignedRollup } from '../team/rollup.ts';
 import { judgeSessionFromStore } from '../judge/orchestrate.ts';
-import { C, color, usd, pct, printNotAGitRepo } from './ui.ts';
+import { C, color, usd, pct, printNotAGitRepo, printJson } from './ui.ts';
 import { type Flags } from './flags.ts';
+import { readBoundedUtf8File, RESOURCE_LIMITS } from '../util/resource-limits.ts';
 
 export async function cmdTeam(flags: Flags): Promise<void> {
   const cfg = loadConfig();
@@ -50,7 +53,7 @@ export async function cmdTeam(flags: Flags): Promise<void> {
     const view = selfView(rows, flags.me, opts);
     store.close();
     if (flags.json) {
-      process.stdout.write(JSON.stringify(view, null, 2) + '\n');
+      printJson(view);
       return;
     }
     console.log('');
@@ -62,7 +65,10 @@ export async function cmdTeam(flags: Flags): Promise<void> {
     console.log(color(tty, C.bold, `  Your AI value — ${view.user}`));
     console.log(color(tty, C.gray, '  ' + '─'.repeat(64)));
     console.log(`  Extraction          ${color(tty, C.cyan, pct(view.extraction))}   ${color(tty, C.gray, 'of your session-scored AI spend (usage without code signals) reached a realized outcome')}`);
-    console.log(`  Confidence          ${pct(view.reliability)}   ${color(tty, C.gray, `${view.sessions} sessions of evidence`)}`);
+    // The shrinkage mixing weight, named as what it is. It says how much of the
+    // figure above is your own sessions rather than the cohort prior — not how
+    // confident anyone should be that the figure is right.
+    console.log(`  Own-data weight     ${pct(view.localDataWeight)}   ${color(tty, C.gray, `${view.sessions} sessions of evidence; the rest is the cohort prior`)}`);
     if (view.cohortComparable && view.percentile !== null && view.vsMedianPct !== null) {
       const sign = view.vsMedianPct >= 0 ? '+' : '';
       console.log(`  vs. team median     ${color(tty, view.vsMedianPct >= 0 ? C.green : C.yellow, `${sign}${(view.vsMedianPct * 100).toFixed(0)}%`)}   ${color(tty, C.gray, `you extract more than ${(view.percentile * 100).toFixed(0)}% of the team`)}`);
@@ -79,7 +85,7 @@ export async function cmdTeam(flags: Flags): Promise<void> {
   const rep = computeCohort(store, { ...window, ...opts });
   store.close();
   if (flags.json) {
-    process.stdout.write(JSON.stringify(rep, null, 2) + '\n');
+    printJson(rep);
     return;
   }
   console.log('');
@@ -104,7 +110,8 @@ export async function cmdTeam(flags: Flags): Promise<void> {
   console.log('');
   console.log(`  Extraction          median ${color(tty, C.cyan, pct(d.medianExtraction))}   ${color(tty, C.gray, `range ${pct(d.p25Extraction)}–${pct(d.p75Extraction)} (p25–p75)`)}`);
   console.log(`  Spread              ${d.broadBased ? color(tty, C.green, 'broad-based') : color(tty, C.yellow, 'concentrated')}   ${color(tty, C.gray, `dispersion ${d.dispersion.toFixed(2)}`)}`);
-  console.log(`  Realized value      ${color(tty, C.gray, `${usd(d.totalRealizedValueUsd)} of ${usd(d.totalCostUsd)} spent`)}`);
+  // Spend, not value: the share of attributed cost that reached a kept outcome.
+  console.log(`  Spend that realized ${color(tty, C.gray, `${usd(d.totalSpendOnRealizedUnitsUsd)} of ${usd(d.totalCostUsd)} spent reached a kept outcome`)}`);
   console.log('');
   console.log(color(tty, C.bold, `  Coaching headroom   ${color(tty, C.green, usd(d.coachingHeadroomUsd))}`));
   console.log(color(tty, C.gray, '  Latent value if everyone below the median were enabled up to it — at their'));
@@ -137,7 +144,7 @@ export async function cmdReceipt(flags: Flags): Promise<void> {
     const file = String(flags.verify);
     let receipt: SignedReceipt;
     try {
-      receipt = JSON.parse(readFileSync(file, 'utf8')) as SignedReceipt;
+      receipt = JSON.parse(readBoundedUtf8File(file, RESOURCE_LIMITS.receiptBytes, 'receipt_bytes')) as SignedReceipt;
     } catch (e) {
       console.error(`  Could not read receipt: ${String(e)}`);
       process.exitCode = 1;
@@ -190,9 +197,18 @@ export async function cmdReceipt(flags: Flags): Promise<void> {
   const units = report.units.filter(
     (u) => !u.maturing && (!flags.unit || u.hash.startsWith(String(flags.unit))),
   );
-  const receipts = units.map((u) =>
-    signReceipt(buildReceiptBody(u.hash, project, u.attributedCostUsd, u.acceptance, u.funnel), keys),
-  );
+  const receipts = units.map((u) => {
+    // Emit the strict v2 body only when the exact effective amount has complete
+    // coverage and can be represented by the legacy numeric compatibility field.
+    // Oversized exact amounts remain valid v1 integrity receipts rather than
+    // being rounded or making the command fail; the exact export remains the
+    // authoritative handoff for those values.
+    const exact = u.economic;
+    const body = exact?.complete && Number.isFinite(Number(exact.amountText))
+      ? buildEconomicReceiptBody(u.hash, project, u.attributedCostUsd, u.acceptance, u.funnel, exact)
+      : buildReceiptBody(u.hash, project, u.attributedCostUsd, u.acceptance, u.funnel);
+    return signReceipt(body, keys);
+  });
   for (const r of receipts) {
     store.saveReceipt({ unit: r.body.unit, project, tsEpochMs: Date.now(), realized: r.body.realized, receiptJson: JSON.stringify(r) });
   }
@@ -288,7 +304,7 @@ export async function cmdJudge(flags: Flags): Promise<void> {
   store.close();
 
   if (flags.json) {
-    process.stdout.write(JSON.stringify(judgment, null, 2) + '\n');
+    printJson(judgment);
     return;
   }
 
@@ -323,7 +339,15 @@ type PushResult =
   | { status: 'empty'; message: string }
   | { status: 'dry-run'; signed: SignedRollup }
   | { status: 'ok'; keyId: string; projectCount: number }
-  | { status: 'error'; message: string };
+  | { status: 'error'; message: string; failureCode?: TeamPushFailureCode; action?: string };
+
+type TeamPushFailureCode = `egress_${EgressErrorCode}` | 'network_error';
+
+function egressRepairAction(code: EgressErrorCode): string | undefined {
+  return code === 'receipt_integrity_failed' || code === 'receipt_persistence_failed'
+    ? 'Repair or restore the local receipt history before retrying; if the lock is stale, confirm no Fiscus writer is active, then remove only that lock and rerun verify.'
+    : undefined;
+}
 
 /**
  * Team rollups can include the local developer's numeric usage and outcome
@@ -356,6 +380,39 @@ function teamPushTransportError(rawUrl: string): string | null {
 }
 
 /**
+ * A rollup scoped to one project is not a snapshot, and the server reads it as
+ * one.
+ *
+ * `aggregateProjects` keeps only `latest_rollup_per_dev` — `SELECT DISTINCT ON
+ * (r.key_id) ... ORDER BY r.key_id, r.received_at DESC` — and treats that one
+ * rollup as the developer's complete window. So a `--project` push silently
+ * erases every OTHER project this machine contributed to from every team total.
+ * It is worse than a missing row: `developerCount` falls with it, and
+ * `buildProjectReport` suppresses any project under `minCohort` contributors, so
+ * a colleague's project can disappear behind a k-anonymity notice that has
+ * nothing to do with them. The totals that remain are wrong in the direction
+ * that looks fine — a smaller, cheaper team.
+ *
+ * WHY THE CLIENT REFUSES RATHER THAN THE SERVER REJECTING. Nothing on the wire
+ * distinguishes a scoped rollup from a complete one, so the server cannot tell.
+ * Putting the coverage in the signed body is the honest repair — a rollup
+ * carrying the basis of its own completeness, which is rule one of this project
+ * applied to a shared figure — and it is a signed-protocol change with a
+ * compatibility story rather than a defect fix. Until it exists, the only sound
+ * position is that a rollup no receiver can consume correctly must not be sent.
+ *
+ * `--dry-run` keeps the flag's inspection use: it prints the scoped rollup and
+ * sends nothing, so it corrupts nothing. Recorded at D-101.
+ */
+function scopedPushRefusal(projectFilter: string | null): string | null {
+  if (projectFilter === null) return null;
+  return `refusing to push a rollup scoped with --project "${projectFilter}" — the team server keeps only your `
+    + 'latest rollup and reads it as your complete window, so this push would erase every other project on this '
+    + 'machine from the shared totals. Push the complete snapshot (drop --project), or use --project with '
+    + '--dry-run to preview one project without sending anything.';
+}
+
+/**
  * Sign and (unless dryRun) push a rollup of the given projects. Pure: no
  * printing, no process.exitCode — callers decide how to present each
  * PushResult. Shared by the one-shot and --watch paths (cmdTeamPush,
@@ -372,9 +429,18 @@ async function signAndPushRollup(
     return { status: 'empty', message };
   }
 
+  // After the empty check, deliberately: a window with nothing in it has no
+  // rollup to corrupt a total with, and "nothing to push" is the truer answer.
+  // Before signing, so a rollup that may not be sent is never minted.
+  const scopeRefusal = scopedPushRefusal(opts.dryRun ? null : opts.projectFilter);
+  if (scopeRefusal !== null) return { status: 'error', message: scopeRefusal };
+
   const to = new Date();
   const from = new Date(to.getTime() - opts.windowDays * 86_400_000);
-  const body = buildRollupBody(opts.keys, projects, { from: from.toISOString(), to: to.toISOString() }, opts.strata);
+  const period = { from: from.toISOString(), to: to.toISOString() };
+  const body = projects.every((project) => project.economic !== undefined)
+    ? buildEconomicRollupBody(opts.keys, projects as EconomicProjectValue[], period, opts.strata)
+    : buildRollupBody(opts.keys, projects, period, opts.strata);
   const signed: SignedRollup = signRollup(body, opts.keys);
 
   if (opts.dryRun) {
@@ -382,7 +448,9 @@ async function signAndPushRollup(
   }
 
   try {
-    const res = await fetch(opts.url!.replace(/\/$/, '') + '/rollups', {
+    const res = await egressFetch(opts.url!.replace(/\/$/, '') + '/rollups', {
+      purpose: 'team_rollup',
+      dataClass: 'team_rollup',
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(signed),
@@ -391,11 +459,21 @@ async function signAndPushRollup(
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
       const message = `push failed: HTTP ${res.status} from ${opts.url}${detail ? ` — ${detail.slice(0, 200)}` : ''}`;
-      return { status: 'error', message };
+      return { status: 'error', message, failureCode: 'network_error' };
     }
+    await discardResponseBody(res);
     return { status: 'ok', keyId: opts.keys.keyId, projectCount: projects.length };
   } catch (e) {
-    return { status: 'error', message: `push failed: ${String(e)}` };
+    if (e instanceof EgressError) {
+      const action = egressRepairAction(e.code);
+      return {
+        status: 'error',
+        message: `Fiscus egress boundary refused team push (${e.code}): ${e.message}${action ? ` ${action}` : ''}`,
+        failureCode: `egress_${e.code}`,
+        action,
+      };
+    }
+    return { status: 'error', message: `push failed: ${String(e)}`, failureCode: 'network_error' };
   }
 }
 
@@ -420,7 +498,9 @@ export async function cmdTeamPush(flags: Flags): Promise<void> {
     console.log(color(tty, C.gray, '  Usage:  fiscus team push --url <url>          send this window\'s per-project value/RoI'));
     console.log(color(tty, C.gray, '          fiscus team push --dry-run             preview without sending'));
     console.log(color(tty, C.gray, '          fiscus team push --pubkey              print this machine\'s rollup signing identity'));
-    console.log(color(tty, C.gray, '          fiscus team push --url <url> --window 7 --project <name>'));
+    console.log(color(tty, C.gray, '          fiscus team push --url <url> --window 7'));
+    console.log(color(tty, C.gray, '          fiscus team push --dry-run --project <name>   preview ONE project; a'));
+    console.log(color(tty, C.gray, '                                                        scoped rollup is never sent'));
     console.log(color(tty, C.gray, '          fiscus team push --url <url> --watch --every 3600   background interval (seconds)'));
     console.log('');
     return;
@@ -472,6 +552,17 @@ export async function cmdTeamPush(flags: Flags): Promise<void> {
   const projectFilter = typeof flags['project'] === 'string' ? flags['project'] : null;
 
   if (flags.watch) {
+    // The loop would otherwise reprint the same refusal on every tick.
+    const scopeRefusal = scopedPushRefusal(projectFilter);
+    if (scopeRefusal !== null) {
+      if (flags.json) {
+        console.log(JSON.stringify({ ok: false, error: scopeRefusal }, null, 2));
+      } else {
+        console.error(`  ${color(tty, C.red, '✗')} ${scopeRefusal}`);
+      }
+      process.exitCode = 1;
+      return;
+    }
     if (!url) {
       const msg = 'no team server URL given — --watch needs somewhere to push: fiscus team push --url <url> --watch';
       if (flags.json) {
@@ -528,7 +619,7 @@ export async function cmdTeamPush(flags: Flags): Promise<void> {
 
   if (result.status === 'error') {
     if (flags.json) {
-      console.log(JSON.stringify({ ok: false, error: result.message }, null, 2));
+      console.log(JSON.stringify({ ok: false, error: result.message, failureCode: result.failureCode, action: result.action }, null, 2));
       process.exitCode = 1;
       return;
     }
