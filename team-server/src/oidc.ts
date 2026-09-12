@@ -36,6 +36,16 @@ export interface OidcConfig {
   jwksCacheTtlMs?: number;
 }
 
+/**
+ * Verification dependencies that are deliberately separate from deploy-time
+ * OIDC configuration. Keeping the clock here means latency in discovery/JWKS
+ * work cannot change the semantics of a boundary test, while production still
+ * defaults to the real wall clock.
+ */
+export interface OidcVerificationContext {
+  nowEpochSeconds?: () => number;
+}
+
 interface Jwk {
   kty: string;
   kid?: string;
@@ -62,6 +72,7 @@ export type VerifyResult = VerifiedIdentity | VerificationFailure;
 const ALLOWED_ALGS = new Set(['RS256', 'ES256']);
 const DEFAULT_JWKS_CACHE_TTL_MS = 10 * 60 * 1000;
 const JWKS_FORCE_REFRESH_COOLDOWN_MS = 30_000;
+const MAX_IDP_JSON_BYTES = 256 * 1024;
 
 function base64UrlDecode(s: string): Buffer {
   return Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
@@ -78,33 +89,97 @@ export function clearJwksCacheForTests(): void {
   jwksForceRefreshedAt.clear();
 }
 
+function validateEndpoint(raw: string, label: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`${label} must be an absolute URL`);
+  }
+  const loopback = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '[::1]';
+  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && loopback)) {
+    throw new Error(`${label} must use HTTPS (HTTP is allowed only for literal loopback)`);
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error(`${label} must not contain credentials, query parameters, or a fragment`);
+  }
+  return parsed;
+}
+
+async function readJsonLimited<T>(response: Response, label: string): Promise<T> {
+  const declaredLength = response.headers.get('content-length');
+  if (declaredLength !== null) {
+    const length = Number(declaredLength);
+    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_IDP_JSON_BYTES) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new Error(`${label} response exceeds the ${MAX_IDP_JSON_BYTES}-byte limit`);
+    }
+  }
+  if (!response.body) return await response.json() as T;
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const next = await reader.read();
+    if (next.done) break;
+    const chunk = Buffer.from(next.value);
+    total += chunk.byteLength;
+    if (total > MAX_IDP_JSON_BYTES) {
+      await reader.cancel();
+      throw new Error(`${label} response exceeds the ${MAX_IDP_JSON_BYTES}-byte limit`);
+    }
+    chunks.push(chunk);
+  }
+  const bytes = Buffer.concat(chunks);
+  try {
+    return JSON.parse(bytes.toString('utf8')) as T;
+  } catch {
+    throw new Error(`${label} response is not valid JSON`);
+  } finally {
+    bytes.fill(0);
+  }
+}
+
 async function discoverJwksUri(issuerUrl: string): Promise<string> {
-  const wellKnown = `${issuerUrl.replace(/\/$/, '')}/.well-known/openid-configuration`;
-  const res = await fetch(wellKnown, { signal: AbortSignal.timeout(10_000) });
-  if (!res.ok) throw new Error(`OIDC discovery failed: HTTP ${res.status} from ${wellKnown}`);
-  const doc = (await res.json()) as { jwks_uri?: unknown };
-  if (typeof doc.jwks_uri !== 'string') throw new Error(`OIDC discovery document at ${wellKnown} is missing jwks_uri`);
-  return doc.jwks_uri;
+  const issuer = validateEndpoint(issuerUrl, 'OIDC issuer URL');
+  const wellKnown = new URL(`${issuer.pathname.replace(/\/$/, '')}/.well-known/openid-configuration`, issuer.origin);
+  const res = await fetch(wellKnown, { signal: AbortSignal.timeout(10_000), redirect: 'error', headers: { accept: 'application/json' } });
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => undefined);
+    throw new Error(`OIDC discovery failed: HTTP ${res.status} from ${wellKnown.origin}`);
+  }
+  const doc = await readJsonLimited<{ jwks_uri?: unknown }>(res, 'OIDC discovery');
+  if (typeof doc.jwks_uri !== 'string') throw new Error(`OIDC discovery document at ${wellKnown.origin} is missing jwks_uri`);
+  const jwks = validateEndpoint(doc.jwks_uri, 'discovered JWKS URL');
+  if (jwks.origin !== issuer.origin) {
+    throw new Error('discovered JWKS URL must share the configured OIDC issuer origin');
+  }
+  return jwks.href;
 }
 
 async function fetchJwks(jwksUrl: string, cacheTtlMs: number, forceRefresh = false): Promise<Jwks> {
-  const cached = jwksCache.get(jwksUrl);
+  const jwksEndpoint = validateEndpoint(jwksUrl, 'JWKS URL');
+  const cacheKey = jwksEndpoint.href;
+  const cached = jwksCache.get(cacheKey);
   if (!forceRefresh && cached && Date.now() - cached.fetchedAtMs < cacheTtlMs) return cached.jwks;
   if (forceRefresh) {
-    const lastForced = jwksForceRefreshedAt.get(jwksUrl) ?? 0;
+    const lastForced = jwksForceRefreshedAt.get(cacheKey) ?? 0;
     if (cached && Date.now() - lastForced < JWKS_FORCE_REFRESH_COOLDOWN_MS) return cached.jwks;
-    jwksForceRefreshedAt.set(jwksUrl, Date.now());
+    jwksForceRefreshedAt.set(cacheKey, Date.now());
   }
-  const res = await fetch(jwksUrl, { signal: AbortSignal.timeout(10_000) });
-  if (!res.ok) throw new Error(`JWKS fetch failed: HTTP ${res.status} from ${jwksUrl}`);
-  const jwks = (await res.json()) as Jwks;
+  const res = await fetch(jwksEndpoint, { signal: AbortSignal.timeout(10_000), redirect: 'error', headers: { accept: 'application/json' } });
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => undefined);
+    throw new Error(`JWKS fetch failed: HTTP ${res.status} from ${jwksEndpoint.origin}`);
+  }
+  const jwks = await readJsonLimited<Jwks>(res, 'JWKS');
   if (!Array.isArray(jwks.keys)) throw new Error(`JWKS response from ${jwksUrl} is missing a keys array`);
-  jwksCache.set(jwksUrl, { jwks, fetchedAtMs: Date.now() });
+  jwksCache.set(jwksEndpoint.href, { jwks, fetchedAtMs: Date.now() });
   return jwks;
 }
 
 async function resolveJwksUrl(cfg: OidcConfig): Promise<string> {
-  if (cfg.jwksUrl) return cfg.jwksUrl;
+  if (cfg.jwksUrl) return validateEndpoint(cfg.jwksUrl, 'configured JWKS URL').href;
   const ttl = cfg.jwksCacheTtlMs ?? DEFAULT_JWKS_CACHE_TTL_MS;
   const cached = discoveryCache.get(cfg.issuerUrl);
   if (cached && Date.now() - cached.fetchedAtMs < ttl) return cached.jwksUri;
@@ -117,8 +192,17 @@ function findCandidates(jwks: Jwks, kid: string | undefined): Jwk[] {
   return kid ? jwks.keys.filter((k) => k.kid === kid) : jwks.keys;
 }
 
+function verifierNow(context: OidcVerificationContext): number | null {
+  const now = context.nowEpochSeconds?.() ?? Math.floor(Date.now() / 1000);
+  return Number.isSafeInteger(now) ? now : null;
+}
+
 /** Verify an OIDC ID token (JWT) against the configured issuer/audience/JWKS. */
-export async function verifyIdToken(token: string, cfg: OidcConfig): Promise<VerifyResult> {
+export async function verifyIdToken(
+  token: string,
+  cfg: OidcConfig,
+  context: OidcVerificationContext = {},
+): Promise<VerifyResult> {
   const parts = token.split('.');
   if (parts.length !== 3) return { valid: false, reason: 'malformed token: expected 3 dot-separated segments' };
   const [headerB64, payloadB64, sigB64] = parts as [string, string, string];
@@ -158,8 +242,6 @@ export async function verifyIdToken(token: string, cfg: OidcConfig): Promise<Ver
   const kid = typeof header.kid === 'string' ? header.kid : undefined;
   let candidates = findCandidates(jwks, kid);
   if (candidates.length === 0) {
-    // The cached JWKS may simply be stale (an IdP key rotation landed mid-TTL)
-    // — force one refresh before concluding the key genuinely doesn't exist.
     try {
       jwks = await fetchJwks(jwksUrl, cacheTtlMs, true);
     } catch (err) {
@@ -193,7 +275,8 @@ export async function verifyIdToken(token: string, cfg: OidcConfig): Promise<Ver
   }
   if (!sigOk) return { valid: false, reason: 'signature mismatch' };
 
-  const now = Math.floor(Date.now() / 1000);
+  const now = verifierNow(context);
+  if (now === null) return { valid: false, reason: 'OIDC verification clock returned invalid epoch seconds' };
   if (typeof payload['exp'] !== 'number' || payload['exp'] <= now) {
     return { valid: false, reason: 'token expired or missing exp' };
   }
@@ -212,16 +295,10 @@ export async function verifyIdToken(token: string, cfg: OidcConfig): Promise<Ver
   if (!audMatches) {
     return { valid: false, reason: `audience mismatch: token aud=${JSON.stringify(aud)}, expected ${cfg.clientId}` };
   }
-  // OpenID Connect requires `azp` when an ID token names multiple audiences,
-  // so a token minted for several applications cannot be replayed here merely
-  // because our client ID appears somewhere in its `aud` array.
   if (Array.isArray(aud) && aud.length > 1 && payload['azp'] !== cfg.clientId) {
     return { valid: false, reason: `authorized party mismatch: token azp=${JSON.stringify(payload['azp'])}, expected ${cfg.clientId} for multiple audiences` };
   }
 
-  // OIDC `sub` is the stable identifier whose uniqueness is scoped to the
-  // issuer. Do not fall back to email: email can change, be absent, and is not
-  // the exact identity an operator configures for aggregate authorization.
   const subject = payload['sub'];
   if (typeof subject !== 'string' || subject.length === 0) {
     return { valid: false, reason: 'token has no non-empty OIDC subject claim (sub)' };

@@ -6,20 +6,48 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Assert integration checkout identity
+        shell: bash
+        env:
+          EXPECTED_INTEGRATION_SHA: ${{ github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [ "$actual" != "$EXPECTED_INTEGRATION_SHA" ]; then
+            echo "expected integration checkout $EXPECTED_INTEGRATION_SHA, got $actual" >&2
+            exit 1
+          fi
+          echo "integration checkout: $actual"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '24'
           cache: npm
-      - run: npm ci
+      # --ignore-scripts: the install itself must not execute a lifecycle script
+      # belonging to any dependency (preinstall/install/postinstall), nor this
+      # package's own `prepare`, which is how `npm ci` otherwise triggers a full
+      # build as an install side effect. Nothing in either lockfile carries an
+      # install script today; the gap was CI having no barrier against a future
+      # one. `npm run build` below is that same build, invoked explicitly -- a
+      # script this repository owns and reviews, never a dependency's.
+      - run: npm ci --ignore-scripts
+      # Explicit, even though `pretest` currently runs the full build too:
+      # `pretest` has been silently narrowed to `--web` once already, and a job
+      # whose dist/ depends on whichever definition it currently carries is one
+      # edit away from testing a stale tree. The build count is unchanged --
+      # before this, `prepare` built at install and `pretest` built again.
+      - run: npm run build
       - run: npm run typecheck
       - run: npm test
 
@@ -27,14 +55,30 @@ jobs:
   # Build the tarball, install it into a clean directory, and invoke its real
   # bin entrypoint without publishing anything.
   package-smoke:
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Assert integration checkout identity
+        shell: bash
+        env:
+          EXPECTED_INTEGRATION_SHA: ${{ github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [ "$actual" != "$EXPECTED_INTEGRATION_SHA" ]; then
+            echo "expected integration checkout $EXPECTED_INTEGRATION_SHA, got $actual" >&2
+            exit 1
+          fi
+          echo "integration checkout: $actual"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '24'
           cache: npm
-      - run: npm ci
+      # No explicit build step here even with --ignore-scripts: the tarball is
+      # produced by `npm pack` below, which runs this package's `prepack`
+      # (`npm run build`) as part of that separate command, unaffected by
+      # --ignore-scripts on this install.
+      - run: npm ci --ignore-scripts
       - run: mkdir -p ../fiscus-pack ../fiscus-install
       - run: npm pack --pack-destination ../fiscus-pack
       - working-directory: ../fiscus-install
@@ -98,6 +142,7 @@ jobs:
   # `pg` as its only dependency) so it gets its own job rather than being folded
   # into `test` above — same OS matrix, run in parallel, never silently skipped.
   team-server-test:
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -107,12 +152,67 @@ jobs:
       run:
         working-directory: team-server
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Assert integration checkout identity
+        shell: bash
+        env:
+          EXPECTED_INTEGRATION_SHA: ${{ github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [ "$actual" != "$EXPECTED_INTEGRATION_SHA" ]; then
+            echo "expected integration checkout $EXPECTED_INTEGRATION_SHA, got $actual" >&2
+            exit 1
+          fi
+          echo "integration checkout: $actual"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '24'
           cache: npm
           cache-dependency-path: team-server/package-lock.json
-      - run: npm ci
+      # team-server has no prepare/prepack of its own -- start/test/typecheck run
+      # straight against source -- so there is nothing load-bearing here for
+      # --ignore-scripts to skip past.
+      - run: npm ci --ignore-scripts
       - run: npm run typecheck
       - run: npm test
+
+  # The pull_request event's default checkout is GitHub's synthetic merge ref.
+  # Keep this separate from the integration matrix and explicitly verify the
+  # candidate head so a green merge-ref run cannot be misreported as head proof.
+  candidate-head:
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 25
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Assert candidate checkout identity
+        shell: bash
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [ "$actual" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "expected candidate head $EXPECTED_HEAD_SHA, got $actual" >&2
+            exit 1
+          fi
+          echo "candidate head checkout: $actual"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # Same reason as the `test` job: this is the run that speaks for the
+      # candidate head rather than the synthetic merge ref, so it must not be
+      # the one testing a stale or absent dist/.
+      - run: npm run build
+      - run: npm run typecheck
+      - run: node ./node_modules/typescript/bin/tsc --noEmit -p src/dashboard/web/app/tsconfig.json
+      - run: npm test
+      - run: npm ci --ignore-scripts
+        working-directory: team-server
+      - run: npm run typecheck
+        working-directory: team-server
+      - run: npm test
+        working-directory: team-server
