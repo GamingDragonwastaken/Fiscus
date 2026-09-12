@@ -13,19 +13,101 @@ import { signal, scopedEffect } from '../core/signal.ts';
 import { api, type BillingPayload } from '../core/api.ts';
 import { isPrecise, relative, basisWords, usd, usdFromMicros, count } from '../core/fmt.ts';
 import { actionCard } from './spend.ts';
+import { projectRenderedAxes } from '../core/claimTypes.ts';
 
-const STATUS_WORDS: Record<string, { plain: string; precise: string; pill: string }> = {
-  not_reconciled: {
+/**
+ * The headline of this card, keyed on the BILLED CLAIM's state.
+ *
+ * It used to be keyed on `evidence.reconciliationStatus`, which `handleBilling`
+ * sends as a constant `'not_reconciled'` describing the trust posture of the
+ * HELD IMPORTED RECORDS. Rendered under a card titled "Reconciliation status"
+ * with the gloss "no observation run recorded", it said that whenever any run
+ * existed — the screen contradicted the run it was describing four lines below.
+ *
+ * That is the same defect as the whole packet: a collapsed status field read as
+ * a claim's state. The claim's state is on the wire now, so read that.
+ */
+const CLAIM_WORDS: Record<string, { plain: string; precise: string; pill: string }> = {
+  unknown: {
     plain: 'Not checked against a provider bill yet.',
-    precise: 'not_reconciled — no observation run recorded',
+    precise: 'unknown — no reconciliation run has been recorded',
     pill: 'pill-unverified',
   },
-  reconciled_with_residual: {
+  conflicted: {
+    plain: 'Checked — and the check disagrees with itself.',
+    precise: 'conflicted — repeated provider observations of the same days disagree',
+    pill: 'pill-warn',
+  },
+  refuted: {
+    plain: 'Checked, and the evidence says no.',
+    precise: 'refuted — the recorded evidence contradicts the billed claim',
+    pill: 'pill-warn',
+  },
+  supported: {
     plain: 'Checked, with an unexplained remainder.',
-    precise: 'reconciled_with_residual — residual is an upper bound on off-path spend',
+    // The unconditional half of this sentence is deliberately gone. D-068
+    // established that the residual bounds off-path spend from above only while
+    // the local rate-card estimate stays at or under the true on-path billed
+    // cost, and a residual below zero refutes that condition outright. The CLI
+    // says so beneath the number; this screen said "residual is an upper bound
+    // on off-path spend" flatly, for every run, including the ones where it is
+    // not one. The condition is now read from the run itself, below.
+    precise: 'reconciled_with_residual — a residual, under the conditions recorded with the run',
     pill: 'pill-ok',
   },
 };
+
+/**
+ * What the recorded residual actually bounds, from the run's own `offPathBound`.
+ *
+ * Absent means a run written before the field existed. That is not a licence to
+ * assume the favourable branch: it says the condition was never recorded, which
+ * is the whole reason the field exists.
+ */
+type ResidualBound = NonNullable<
+  NonNullable<NonNullable<BillingPayload['reconciliation']>['runs']>[number]['result']['offPathBound']
+>;
+
+/**
+ * A `Record` rather than an if-chain, keyed by the wire's own union.
+ *
+ * That is the gate: adding a state to `offPathBound` in `shared-types.ts`
+ * without a rendering here fails the BROWSER typecheck. With an if-chain the
+ * new state fell through to the "older than the check" sentence below, which
+ * would have said a fresh run predates a field it carries — an unrecognised
+ * value rendered as an absent one, which is the defect class this screen keeps
+ * finding.
+ */
+const RESIDUAL_BOUND_WORDS: Readonly<Record<ResidualBound, { precise: string; plain: string }>> = {
+  none_local_estimate_exceeds_provider: {
+    precise: 'residual bounds nothing — the local estimate exceeds the provider total, so no upper bound on off-path spend survives',
+    plain: 'This remainder cannot tell you how much went outside Fiscus: our own estimate already came out higher than the provider’s bill.',
+  },
+  upper_bound_conditional: {
+    precise: 'residual is an upper bound on off-path spend while the local estimate does not exceed true on-path billed cost',
+    plain: 'At most this much could have gone outside Fiscus — assuming our own pricing did not overshoot what you were really charged.',
+  },
+  unknown_local_total_truncated_by_retention: {
+    precise: 'residual bounds nothing — retention deleted request rows from inside this period, so the local total is a known undercount by an unknown amount',
+    plain: 'This remainder cannot tell you how much went outside Fiscus: some of your own metered requests in this period were deleted by your retention setting, so part of the difference is traffic we did see.',
+  },
+};
+
+/** Whether the run's own bound state is bad news rather than a caveat. */
+function residualBoundIsError(bound: string | undefined): boolean {
+  return bound === 'none_local_estimate_exceeds_provider'
+    || bound === 'unknown_local_total_truncated_by_retention';
+}
+
+function residualBoundWords(bound: string | undefined, precise: boolean): string {
+  const words = bound === undefined ? undefined : RESIDUAL_BOUND_WORDS[bound as ResidualBound];
+  if (words === undefined) {
+    return precise
+      ? 'this run predates the recorded bound condition, so what the residual bounds is not established'
+      : 'This run is older than the check that says what the remainder means, so we cannot tell you.'
+  }
+  return precise ? words.precise : words.plain;
+}
 
 /**
  * What a reconciliation would actually match, stated before the credential.
@@ -40,9 +122,21 @@ function readinessPanel(d: BillingPayload): Node | null {
   const r = d.readiness;
   if (!r) return null;
   const c = r.coverage;
-  // No OpenAI spend at all: nothing to warn about, and saying "0 would count"
-  // would read as a defect rather than as an empty ledger.
-  if (!c) return null;
+  // A deletion reaches this screen as `coverage === null`, exactly like a
+  // machine that never metered OpenAI -- and the null used to be rendered as
+  // silence on the strength of a comment that read "no OpenAI spend at all:
+  // nothing to warn about". That silence is the whole panel, so a prune turned
+  // the credential warning OFF (D-186). An emptied ledger says so instead.
+  const truncated = r.localLedgerRetention?.truncated === true;
+  if (!c) {
+    if (!truncated) return null;
+    const before = r.localLedgerRetention.prunedBeforeMs;
+    return h('div', { class: 'drawer-warning', style: 'margin-top: var(--s4)' },
+      h('strong', { text: 'This ledger was emptied by retention' }),
+      h('p', { text: () => (isPrecise()
+        ? `No OpenAI rows survive, and retention deleted rows before ${before === null ? 'an unrecorded boundary' : new Date(before).toISOString().slice(0, 10)}. Whether any OpenAI spend was metered here cannot be read from the ledger, so nothing about what a reconciliation would match is stated.`
+        : `Your older records were deleted, so there is no OpenAI spend left here to check. We cannot tell you whether there ever was any — only that it is gone.`) }));
+  }
   const uncountable = c.importedUsd + c.proxyOffScopeUsd;
   if (c.onDeclaredRouteUsd > 0 || uncountable <= 0) return null;
 
@@ -52,7 +146,14 @@ function readinessPanel(d: BillingPayload): Node | null {
       ? `${usd(c.importedUsd, { precise: true })} across ${count(c.importedRequests)} request(s) arrived by native import — model and cost recorded, no tie to a declared provider project`
       : `${usd(c.importedUsd)} came from reading your tools' own logs, which do not record which provider project the spend belongs to`) }));
   }
-  if (c.proxyOffScopeUsd > 0) {
+  if (c.proxyOffScopeUsd > 0 && c.declaredScopeId === null) {
+    // Right verdict, wrong reason if left unbranched: no scope is active, so
+    // nothing CAN be on a declared route, and that is not a fact about these
+    // rows (D-187).
+    lines.push(h('li', { text: () => (isPrecise()
+      ? `${usd(c.proxyOffScopeUsd, { precise: true })} across ${count(c.proxyOffScopeRequests)} proxy request(s) were metered while no scope is active — nothing can be on a declared route until one is`
+      : `${usd(c.proxyOffScopeUsd)} went through the proxy, but no project is declared right now, so there is nothing to match it against`) }));
+  } else if (c.proxyOffScopeUsd > 0) {
     lines.push(h('li', { text: () => (isPrecise()
       ? `${usd(c.proxyOffScopeUsd, { precise: true })} across ${count(c.proxyOffScopeRequests)} proxy request(s) predate the declaration or carry a different one`
       : `${usd(c.proxyOffScopeUsd)} went through the proxy before you declared the project, so it cannot be matched either`) }));
@@ -144,8 +245,10 @@ export function evidenceView(): Node {
       const d = data();
       if (!d) return h('div', { class: 'card' }, h('p', { class: 'drawer-muted', role: 'status', 'aria-live': 'polite', 'aria-busy': 'true', text: 'Loading…' }));
 
-      const fallback = { plain: d.evidence.reconciliationStatus, precise: d.evidence.reconciliationStatus, pill: 'pill-unverified' };
-      const status = STATUS_WORDS[d.evidence.reconciliationStatus] ?? fallback;
+      // A payload with no stated support is a payload that said nothing, which
+      // is `unknown` — not a licence to fall back to the records' label.
+      const claimState = d.claimSupport ? projectRenderedAxes(d.claimSupport.profile).epistemic : 'unknown';
+      const status = CLAIM_WORDS[claimState] ?? CLAIM_WORDS.unknown!;
       // Newest recorded run, read from the immutable collection the server
       // sends. This used to read `reconciliation.latest`, a field that has
       // never been on the wire — so it was always null and this screen reported
@@ -156,12 +259,33 @@ export function evidenceView(): Node {
         h('div', { class: 'card' },
           h('div', { class: 'card-head' },
             h('span', { class: 'card-title', text: 'Reconciliation status' }),
-            h('span', { class: `pill ${status.pill}`, text: d.evidence.reconciliationStatus.replace(/_/g, ' ') })),
+            h('span', { class: `pill ${status.pill}`, text: claimState })),
           h('p', { text: () => (isPrecise() ? status.precise : status.plain) }),
+          // The server's own one-line reason, where it has one the payload does
+          // not otherwise show. Rendering it beats restating the axes here in
+          // different words, which is how two descriptions of one judgement come
+          // apart.
+          d.claimSupport?.note
+            ? h('p', { class: 'basis', text: d.claimSupport.note })
+            : null,
           latest
             ? h('div', null,
+                // What the residual bounds is a property of THIS run, not of the
+                // status word, and it is the sentence an operator acts on.
+                h('p', { class: residualBoundIsError(latest.result.offPathBound) ? 'drawer-error' : 'basis',
+                  text: () => residualBoundWords(latest.result.offPathBound, isPrecise()) }),
                 h('span', { class: 'basis', text: () => `provider side: ${basisWords(latest.result.providerSourceKind)}` }),
-                h('span', { class: 'basis', text: `last run ${relative(latest.computedAtMs)}` }))
+                latest.result.snapshotStability === 'changed_across_observations'
+                  ? h('span', { class: 'drawer-error', text: () => (isPrecise()
+                      ? `snapshot stability: changed across observations on ${(latest.result.unstableDayStartMs ?? []).length} day(s) — this reconciliation is contradicted, not established`
+                      : 'Careful: the provider reported different figures for the same days at different times. This check disagrees with itself.') })
+                  : null,
+                h('span', { class: 'basis', text: `last run ${relative(latest.computedAtMs)}` }),
+                // The constant the headline used to be built from, restored to
+                // its actual subject: the held import records, not the run.
+                h('span', { class: 'basis', text: () => (isPrecise()
+                  ? `held provider records: ${d.evidence.reconciliationStatus.replace(/_/g, ' ')}`
+                  : 'The provider records themselves are still operator-supplied and unverified.') }))
             : h('span', { class: 'basis', text: () => (isPrecise()
                 ? 'zero recorded observation runs'
                 : 'no check has been run on this machine yet') }),

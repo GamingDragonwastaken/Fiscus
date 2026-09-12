@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..');
@@ -140,7 +140,13 @@ const CURRENT_CLAIM_SURFACES = [
   'src/dashboard/web/app/views/data.ts',
   'src/dashboard/web/app/views/value.ts',
   'src/store/db.ts',
-  'src/value/voi.ts',
+  'src/cli/teamCmd.ts',
+  'src/value/instrumentationSensitivity.ts',
+  'src/value/lenses.ts',
+  'src/value/frontier.ts',
+  'src/value/reliability.ts',
+  'src/value/cohort.ts',
+  'src/value/drift.ts',
   'src/judge/tier.ts',
   'src/judge/orchestrate.ts',
   'web/index.html',
@@ -162,6 +168,18 @@ const REJECTED_LIVE_CLAIMS: ReadonlyArray<[string, RegExp]> = [
   ['historical path-prefix machine-boundary claim', /proving the prefix never leaves the machine\./i],
   ['causal RoI formula in live docs', /RoI_causal\s*=\s*RoI_gross/i],
   ['causal RoI break-even formula in live docs', /RoI_causal[^\n]{0,240}(?:pays for itself|break-even)/is],
+  // WP-A07. The aggregator, its weights and the shrinkage weight are all
+  // legitimate calculations described in language stronger than the mathematics
+  // supports. Each pattern below names one specific overclaim, not the
+  // calculation it decorates.
+  ['geometric form asserted as forced without its axiom set', /\b(?:form is forced|forces the log generator)\b/i],
+  ['lens weights called empirical output elasticities', /lens(?:es)?['’]?s? (?:\*\*)?output elasticit/i],
+  ['CES substitution parameter called the elasticity of substitution', /θ is the elasticity of substitution/],
+  ['aggregator zero-collapse asserted as economic impossibility', /no (?:single )?axis can (?:compensate|be bought back)/i],
+  ['Stein dominance claimed for empirical-Bayes rate shrinkage', /Stein['’]s result|strictly beats the raw rate/i],
+  ['shrinkage weight labelled confidence', /plain-language ["“]confidence["”]|Confidence[^\n]{0,32}(?:view\.reliability|\.reliability\b)/i],
+  ['observational separation labelled evidence-supported', /evidence_supported/],
+  ['rate drift labelled Goodhart without an incentive model', /Goodhart(?:-proof|-resistance| alarm| streams| watch)/i],
 ];
 
 const INTENTIONAL_REJECTED_CLAIMS = [
@@ -178,6 +196,15 @@ const INTENTIONAL_REJECTED_CLAIMS = [
     text: 'proving the prefix never leaves the machine.',
     count: 1,
     reason: 'historical path-prefix forwarding evidence retained verbatim',
+  },
+  {
+    relativePath: 'docs/RELEASE-GATE.md',
+    label: 'observational separation labelled evidence-supported',
+    text: 'evidence_supported',
+    count: 11,
+    reason:
+      'commit-bound gate rows record the label the packaged artifact carried at that commit — each row says the demo showed NO evidence_supported. ' +
+      'Rewriting them would falsify the evidence they exist to preserve. New rows use the observational label; this count must be reviewed, not bumped.',
   },
 ] as const;
 
@@ -245,14 +272,55 @@ test('CLI and ROI documentation qualify scenario values separately from causal r
   assert.match(roiDocs, /qualified causal-study result|causal net benefit result is separate/i);
 });
 
-test('VoI and methodology describe coverage and two-direction sensitivity', () => {
+test('instrumentation sensitivity and methodology describe coverage and two-direction movement', () => {
   const methodology = read('docs', 'METHODOLOGY.md');
-  const voi = read('src', 'value', 'voi.ts');
+  const sensitivity = read('src', 'value', 'instrumentationSensitivity.ts');
 
   assert.match(methodology, /measured|unmeasured|unknown necessary lenses/i);
   assert.match(methodology, /coverage/i);
-  assert.match(voi, /reference|sensitivity/i);
-  assert.match(voi, /may raise or lower|either direction/i);
+  assert.match(sensitivity, /reference|sensitivity/i);
+  assert.match(sensitivity, /may raise or lower|either direction/i);
+});
+
+test('the ambiguous realized-value identifier cannot return to the source tree', () => {
+  // AII-012. `realizedValueUsd` named two different claims: the attributed
+  // SPEND on units that realized, and the manual-equivalent VALUE they produced.
+  // Reading one where the other was meant is not a typo — it is the collapse of
+  // cost into value that this product exists to refuse, and it shipped once
+  // precisely because both fields were real, numeric and identically named, so
+  // neither the compiler nor a reviewer could see it. The split identifiers make
+  // that substitution a type error; this keeps the ambiguous name from coming
+  // back and quietly re-enabling it.
+  const offenders: string[] = [];
+  let scanned = 0;
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(join(ROOT, dir), { withFileTypes: true })) {
+      const rel = `${dir}/${entry.name}`;
+      if (entry.isDirectory()) {
+        if (entry.name === 'node_modules' || entry.name === 'dist') continue;
+        walk(rel);
+        continue;
+      }
+      if (!/\.(ts|html|mjs)$/.test(entry.name)) continue;
+      // Backtick-quoted mentions are prose explaining why the name was split,
+      // which is worth keeping. Anything else is the identifier itself.
+      const source = read(...rel.split('/'));
+      scanned += 1;
+      // `realizedValueRate` was the same conflation one derivative down: a share
+      // of attributed SPEND, named as a rate of value.
+      if (/(?<![A-Za-z`])(?:realizedValueUsd|realizedValueRate)(?![A-Za-z`])/.test(source)) offenders.push(rel);
+    }
+  };
+  walk('src');
+  // `team-server/` is a separate npm project with its own tsconfig, so the root
+  // typecheck cannot see it — but it imports `ProjectValue` straight out of
+  // `src/team/rollup.ts`. The first attempt at this migration renamed `src/`
+  // only, passed every root gate, and broke the team-server typecheck on CI in
+  // sixteen places. A ban that stops at `src/` is a ban with a hole in it.
+  walk('team-server/src');
+  walk('team-server/test');
+  assert.ok(scanned > 150, `the walk must be non-vacuous, scanned ${scanned}`);
+  assert.deepEqual(offenders, [], 'use spendOnRealizedUnitsUsd / realizedSpendShare for cost, manualEquivalentValueUsd for value; never the ambiguous names');
 });
 
 test('intentional historical or quoted claim matches are explicit and narrow', () => {

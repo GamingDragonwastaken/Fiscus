@@ -579,6 +579,38 @@ const usd = (n) => {
 const money = (n) => (n == null ? '—' : n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
 const tok = (n) => (n || 0).toLocaleString('en-US');
 
+// Every value-bearing section must say whether its dollars are exact effective
+// evidence, a partial exact projection, or a legacy numeric compatibility total.
+// The helper is deliberately defensive because this page also renders payloads
+// from older local servers; malformed or missing coverage never becomes a green
+// exact claim, and every external string is escaped before entering the fragment.
+function economicCoverageHtml(rollup, label) {
+  const heading = typeof label === 'string' && label.length > 0 ? label : 'Exact economic coverage';
+  if (!rollup || typeof rollup !== 'object' || Array.isArray(rollup)) {
+    return '<div class="bsub economic-coverage" role="status">' + esc(heading) + ': legacy_unknown — exact coverage was not reported; numeric costs are compatibility projections.</div>';
+  }
+  const coverage = rollup.coverage === 'exact' || rollup.coverage === 'partial' || rollup.coverage === 'legacy_unknown'
+    ? rollup.coverage
+    : 'legacy_unknown';
+  const total = rollup.total && typeof rollup.total === 'object' && !Array.isArray(rollup.total) ? rollup.total : null;
+  const amount = total && typeof total.amountText === 'string' ? total.amountText : null;
+  const requests = total && Number.isSafeInteger(total.requestCount) && total.requestCount >= 0 ? total.requestCount : null;
+  const unresolved = total && Number.isSafeInteger(total.unresolvedRequests) && total.unresolvedRequests >= 0 ? total.unresolvedRequests : null;
+  const requestText = requests == null ? 'an unknown number of' : requests.toLocaleString('en-US');
+  const bases = total && Array.isArray(total.sourceBases)
+    ? total.sourceBases.map((base) => esc(String(base))).join(', ')
+    : '';
+  const complete = coverage === 'exact' && total !== null && total.complete === true && amount !== null && unresolved === 0;
+  if (complete) {
+    return '<div class="bsub economic-coverage" role="status">' + esc(heading) + ': complete — ' + esc(amount) + ' effective spend across ' + requestText + ' request(s); source bases: ' + (bases || 'none') + '.</div>';
+  }
+  if ((coverage === 'partial' || coverage === 'exact') && amount !== null) {
+    const unresolvedText = unresolved == null ? 'some' : unresolved.toLocaleString('en-US');
+    return '<div class="bsub economic-coverage" role="status">' + esc(heading) + ': partial — ' + esc(amount) + ' effective spend resolved across ' + requestText + ' request(s); ' + unresolvedText + ' unresolved legacy request(s) remain in the numeric compatibility total.</div>';
+  }
+  return '<div class="bsub economic-coverage" role="status">' + esc(heading) + ': legacy_unknown — no complete exact request evidence; numeric costs are compatibility projections.</div>';
+}
+
 // Full chart with $-gridlines and time labels (mockup U1's SPEND OVER TIME).
 function sparkline(series) {
   if (!series.length) return '<div style="color:var(--faint);font-family:var(--mono);font-size:12px;padding:40px 0;text-align:center">no spend recorded in this window</div>';
@@ -744,6 +776,10 @@ function render(d) {
     const stale = ps.stale === true;
     const age = ps.ageDays == null ? 'freshness unknown' : `${ps.ageDays}d old`;
     const source = ps.source === 'cache' ? 'refreshed local cache' : 'bundled package card';
+    const activeCardProvenance = ps.cardProvenance;
+    const activeCardLine = activeCardProvenance
+      ? String(activeCardProvenance.sourceKind || 'unknown') + ' · accepted locally ' + String(activeCardProvenance.fetchedAt || 'unknown') + (activeCardProvenance.sourceUrl ? ' · ' + String(activeCardProvenance.sourceUrl) : '')
+      : 'card provenance unavailable';
     const estimateShare = Number(pricing.estimatedSpendShare || 0);
     const estimate = pricing.estimatedCostUsd > 0
       ? `$${usd(pricing.estimatedCostUsd)} (${estimateShare >= 0.01 ? Math.round(estimateShare * 100) : '<1'}% of shown spend)`
@@ -754,6 +790,10 @@ function render(d) {
       : 'Manual only; run fiscus pricing --refresh to check the configured public source.';
     const provenanceRows = provenance.slice(0, 5).map((row) => {
       const card = row.rateCardSha256 ? String(row.rateCardSha256).slice(0, 12) : 'no rate card';
+      const cardProvenance = row.rateCardProvenance;
+      const cardProvenanceLine = cardProvenance
+        ? String(cardProvenance.sourceKind || 'unknown') + ' · accepted locally ' + String(cardProvenance.fetchedAt || 'unknown') + (cardProvenance.sourceUrl ? ' · ' + String(cardProvenance.sourceUrl) : '')
+        : 'card provenance unavailable';
       const match = row.rateMatchKind === 'exact_provider'
         ? 'exact local match'
         : String(row.rateMatchKind || 'unknown').replace(/_/g, ' ');
@@ -762,7 +802,7 @@ function render(d) {
         : null;
       const model = `${row.provider || 'unknown'} / ${row.model || 'unknown'}`;
       const matchEvidence = matched && matched !== model ? `${match} → ${matched}` : match;
-      return `<tr><td class="model">${esc(model)}</td><td class="num">${Number(row.requests || 0).toLocaleString()}</td><td class="num">${esc(String(row.costBasis || 'legacy_unknown').replace(/_/g, ' '))}</td><td class="num">${esc(matchEvidence)} · ${esc(card)}</td><td class="cost">$${usd(Number(row.costUsd || 0))}</td></tr>`;
+      return `<tr><td class="model">${esc(model)}</td><td class="num">${Number(row.requests || 0).toLocaleString()}</td><td class="num">${esc(String(row.costBasis || 'legacy_unknown').replace(/_/g, ' '))}</td><td class="num">${esc(matchEvidence)} · ${esc(card)}<div class="bsub">${esc(cardProvenanceLine)}</div></td><td class="cost">$${usd(Number(row.costUsd || 0))}</td></tr>`;
     }).join('');
     const provenanceTable = provenance.length === 0
       ? '<div class="tag" style="margin-top:var(--s4)">No metered requests in this window, so there is no recorded rate-card provenance to inspect.</div>'
@@ -771,7 +811,7 @@ function render(d) {
       <div class="label">Rate-card health · local list-price estimates</div>
       <div style="display:flex;gap:var(--s5);align-items:flex-start;justify-content:space-between;flex-wrap:wrap">
         <div><div style="font-family:var(--mono);font-size:16px;color:${stale ? 'var(--coral)' : 'var(--mint)'}">${stale ? 'STALE' : 'FRESH'} · ${esc(age)}</div>
-          <div class="tag" style="margin-top:6px">${esc(source)} · ${Number(ps.modelCount || 0).toLocaleString()} models · ${esc(ps.cacheIntegrity || 'unknown integrity')}</div></div>
+           <div class="tag" style="margin-top:6px">${esc(source)} · ${Number(ps.modelCount || 0).toLocaleString()} models · ${esc(ps.cacheIntegrity || 'unknown integrity')} · ${esc(activeCardLine)}</div></div>
         <div><div class="label" style="margin-bottom:4px">Estimated-rate share</div><div style="font-family:var(--mono);color:${pricing.estimatedCostUsd > 0 ? 'var(--coral)' : 'var(--mint)'}">${esc(estimate)}</div></div>
       </div>
       <div class="tag" style="margin-top:var(--s4)">${esc(maintenance)} Historical rows keep their recorded card evidence; Fiscus does not claim provider-billed cost here.</div>
@@ -1053,6 +1093,15 @@ function renderBilling(d) {
     const variance = Number(latest.unexplainedVarianceMicros || 0);
     const cov = latest.coverage && typeof latest.coverage === 'object' ? latest.coverage : {};
     const stability = String(latest.snapshotStability || 'single_observation').replace(/_/g, ' ');
+    // A residual at or below zero means the local rate-card ESTIMATE exceeds
+    // everything the provider billed on this scope, which refutes the very
+    // condition under which the residual bounds off-path spend. Reading it as
+    // "nothing went off-path" is an absence inference the arithmetic does not
+    // license (AII-002), and it is the reading a small number invites.
+    const offPathBound = String(latest.offPathBound || 'upper_bound_conditional');
+    const offPathNote = offPathBound === 'upper_bound_conditional'
+      ? 'The residual is an <b>upper bound</b> on spend that never passed through Fiscus — conditional on your route declaration and on the local rate-card estimate not exceeding the true on-path billed cost. It is not a measurement of off-path spend.'
+      : 'The local rate-card estimate <b>exceeds</b> the provider total for this scope, so this residual bounds nothing: over-estimation has absorbed an unknown amount of any off-path spend. A residual at or below zero is not evidence that nothing went off-path.';
     const days = Array.isArray(latest.days) ? latest.days : [];
     const notable = days.filter((x) => x && (x.material || x.residualReason === 'no_local_capture' || x.residualReason === 'no_provider_report')).slice(0, 8);
     const dayRows = notable.map((x) => `<tr>
@@ -1064,7 +1113,8 @@ function renderBilling(d) {
     </tr>`).join('');
     return `<div class="card billing-note fade" style="grid-column:1/-1">
       <div class="label">Provider reconciliation ${tip('A comparison of two totals for one provider project, per UTC day: what the provider Costs API reported, and what Fiscus metered on the route you declared belongs to that project. The <b>grain is a day total</b> — provider line items do not join to models or requests, and pretending otherwise would mean inventing an allocation. The residual is the OUTPUT, not an error: it is an upper bound on spend that never passed through Fiscus, and it holds only if your route declaration is true, which nothing here verifies with the provider.')}</div>
-      <div class="billing-state">RECONCILED WITH RESIDUAL · SCOPE-CONDITIONAL${latest.providerSourceKind === 'operator_supplied_export' ? ' · OPERATOR-SUPPLIED PROVIDER SIDE' : ''}</div>
+      <div class="billing-state">RECONCILED WITH RESIDUAL · SCOPE-CONDITIONAL${offPathBound === 'upper_bound_conditional' ? '' : ' · RESIDUAL BOUNDS NOTHING'}${latest.providerSourceKind === 'operator_supplied_export' ? ' · OPERATOR-SUPPLIED PROVIDER SIDE' : ''}</div>
+      <p class="bsub" style="margin-top:var(--s3)">${offPathNote}</p>
       ${latest.providerSourceKind === 'operator_supplied_export' ? '<p class="bsub" style="margin-top:var(--s3)">The provider figures in this comparison were <b>supplied by an operator</b>, not read from the provider by Fiscus. The arithmetic is identical and the evidence is weaker: nothing here can detect a report that was edited before it was handed over. A read-only Costs pull is the stronger route.</p>' : ''}
       <div class="bars" style="margin-top:var(--s3)">
         <div class="bar"><div class="top"><span class="name">Provider reported</span><span class="cost">${billingUsd(latest.providerReportedMicros)}</span></div><div class="meta">${esc(String(latest.providerProjectRef || '—'))}</div></div>
@@ -1372,6 +1422,10 @@ function renderValue(d) {
   // counterfactual claim. Only a separate qualified study may render causal
   // net benefit, and this legacy view deliberately renders no study result.
   const rr = roi && roi.returnRatio;
+  const matureEconomic = d.realization?.matured?.economic;
+  const matureEconomicLine = economicCoverageHtml(matureEconomic, 'Exact economic coverage');
+  const usageEconomicLine = economicCoverageHtml(d.usage?.economic, 'Usage exact economic coverage');
+  const budgetEconomicLine = economicCoverageHtml(d.budget?.economic, 'Budget exact economic coverage');
   let returnHtml = '';
   if (rr && rr.basis === 'usd' && rr.grossRatio != null) {
     const head = rr.grossRatio;
@@ -1379,8 +1433,8 @@ function renderValue(d) {
     const verdict = 'observed/manual-equivalent; not causal evidence';
     const detail = ' · realized manual-equivalent value; a qualified randomized study is required for causal net benefit';
     returnHtml = `<div class="sub" style="margin-top:10px;font-size:12.5px;color:var(--muted)">${title} ${tip('Realized manual-equivalent value divided by honest cost. This scenario cannot establish what would have happened without AI.')}<b style="color:var(--gold);font-family:var(--mono)">${head.toFixed(2)}×</b> — ${verdict}`
-      + `<div style="color:var(--faint);font-size:11px;margin-top:2px">$${money(rr.realizedValueUsd)} realized work ÷ $${money(rr.costUsd)} cost (tokens + your time)${detail}</div></div>`;
-  } else if (rr && rr.realizedValueUsd != null && !rr.supervisionPriced) {
+      + `<div style="color:var(--faint);font-size:11px;margin-top:2px">$${money(rr.manualEquivalentValueUsd)} realized work ÷ $${money(rr.costUsd)} cost (tokens + your time)${detail}</div></div>`;
+  } else if (rr && rr.manualEquivalentValueUsd != null && !rr.supervisionPriced) {
     returnHtml = `<div class="sub" style="margin-top:10px;font-size:11.5px;color:var(--faint)">Observed value scenario — not yet priced. Route real traffic through the proxy so your time-with-AI can be measured${tip('The dollar scenario cannot be priced until your <b>time-with-AI</b> is measured. Route real traffic through the proxy so supervision time is captured; without it, a dollar figure would be invented.')}</div>`;
   }
 
@@ -1476,8 +1530,8 @@ function renderValue(d) {
     ? `<div class="card fade" style="grid-column:1/-1">
         <div class="label">Cheaper model trials ${tip('Local historical comparison only. Fiscus does <b>not</b> change routing. A candidate must cost less and have no worse observed realized-outcome rate for the same task type. Each model is priced by <b>its own attributed spend</b>, not by the whole window it worked in — a unit whose window is more than 20% other models cannot price a model and is excluded and counted. <b>Historical-equivalent headroom</b> is what the incumbent\'s observed units would have saved at the candidate\'s historical per-unit cost; it is a local list-price estimate, not provider-billed savings and not a guarantee of future cost.<br><br>A result is capped at <b>TRIAL</b> whenever the comparison cannot isolate the model: the saving does not survive dividing by changed lines, the units come from too few working sessions to be independent, the two sides were priced on different bases or across a rate-card change, the cohorts differ sharply in unit size, or the models were used in non-overlapping periods. Each reason is named on the card.')}</div>
         ${switches.slice(0, 4).map((m) => {
-          const tag = m.confidence === 'evidence_supported' ? 'EVIDENCE' : 'TRIAL';
-          const cls = m.confidence === 'evidence_supported' ? 'grow' : 'trim';
+          const tag = m.confidence === 'observational_separation' ? 'SEPARATED' : 'TRIAL';
+          const cls = m.confidence === 'observational_separation' ? 'grow' : 'trim';
           const candidateRate = Math.round(Number(m.candidateRealizationRate || 0) * 100);
           const incumbentRate = Math.round(Number(m.incumbentRealizationRate || 0) * 100);
           // Surface the excluded units on the card itself: a sample that silently
@@ -1498,8 +1552,8 @@ function renderValue(d) {
           const sessions = ` · from ${Number(m.candidateSessions || 0)} vs ${Number(m.incumbentSessions || 0)} working sessions`;
           const evidence = `${Number(m.candidateUnits || 0)} vs ${Number(m.incumbentUnits || 0)} mature units · observed realization ${candidateRate}% vs ${incumbentRate}%${perLine}${sessions}${droppedNote}${staleNote}`;
           const confounders = m.confounders || [];
-          const confidenceNote = m.confidence === 'evidence_supported'
-            ? 'anytime-valid outcome bounds separate'
+          const confidenceNote = m.confidence === 'observational_separation'
+            ? 'anytime-valid outcome bounds separate under the observational procedure — not a causal effect'
             : confounders.length
               ? 'confounded — see below; kept as a trial regardless of the statistics'
               : 'intervals overlap — keep this as a measured trial, not a default change';
@@ -1516,8 +1570,10 @@ function renderValue(d) {
   // By-project value — the budget owner's view (who/what is the spend paying off).
   let projectCard = '';
   if (d.projects && d.projects.length) {
-    const prows = d.projects.map((p) =>
-      `<tr><td class="model">${esc(p.project)}${p.sources && p.sources.length ? `<div style="font-size:10.5px;color:var(--faint);font-family:var(--mono)">coded with ${esc(p.sources.join(' · '))}</div>` : ''}</td><td>${p.units}</td><td class="cost">$${money(p.costUsd)}</td><td>${Math.round(p.realizationRate * 100)}%</td><td class="roi">${p.roiIndex == null ? '—' : Math.round(p.roiIndex)}</td></tr>`).join('');
+    const prows = d.projects.map((p) => {
+      const projectEconomicLine = economicCoverageHtml(p.economic, 'Project exact economic coverage');
+      return `<tr><td class="model">${esc(p.project)}${p.sources && p.sources.length ? `<div style="font-size:10.5px;color:var(--faint);font-family:var(--mono)">coded with ${esc(p.sources.join(' · '))}</div>` : ''}</td><td>${p.units}</td><td class="cost">$${money(p.costUsd)}${projectEconomicLine}</td><td>${Math.round(p.realizationRate * 100)}%</td><td class="roi">${p.roiIndex == null ? '—' : Math.round(p.roiIndex)}</td></tr>`;
+    }).join('');
     // Cross-project raw allocation is descriptive at best, never a UI action.
     const pa = null;
     const paHtml = (pa && pa.moves && pa.moves.length)
@@ -1540,6 +1596,7 @@ function renderValue(d) {
   // Team value — distribution only, never a leaderboard. When off/suppressed the
   // payload carries no per-user data, so the card renders the guardrail state.
   const team = d.team;
+  const teamEconomicLine = economicCoverageHtml(team?.distribution?.economic, 'Team exact economic coverage');
   let teamCard = '';
   if (team && !team.suppressed && team.distribution) {
     const t = team.distribution;
@@ -1551,7 +1608,8 @@ function renderValue(d) {
       <div class="rrow"><span style="color:var(--muted)">Extraction (median)</span><span style="font-family:var(--mono)">${Math.round(t.medianExtraction * 100)}% <span style="color:var(--faint)">· ${Math.round(t.p25Extraction * 100)}–${Math.round(t.p75Extraction * 100)}% p25–p75</span></span></div>
       <div class="rrow"><span style="color:var(--muted)">Spread</span><span style="font-family:var(--mono)">${spread} <span style="color:var(--faint)">· ${t.cohortSize} people, unidentified</span></span></div>
       <div class="rrow"><span style="color:var(--muted)">Coaching headroom ${tip('Latent value if everyone below the median were enabled up to it, at their own current spend. A case for training/support — <b>not</b> a ranking of people.')}</span><span style="font-family:var(--mono);color:var(--mint)">+$${money(t.coachingHeadroomUsd)}</span></div>
-      <div class="lenshow">Realized value $${money(t.totalRealizedValueUsd)} of $${money(t.totalCostUsd)} spent (sessions without code signals). A person sees their own number with <span style="color:var(--gold)">fiscus team --me &lt;user&gt;</span>.</div>
+      ${teamEconomicLine}
+      <div class="lenshow">Realized value $${money(t.totalSpendOnRealizedUnitsUsd)} of $${money(t.totalCostUsd)} spent (sessions without code signals). A person sees their own number with <span style="color:var(--gold)">fiscus team --me &lt;user&gt;</span>.</div>
     </div>`;
   } else if (team && team.enabled && team.suppressed) {
     teamCard = `<div class="card fade" style="grid-column:1/-1">
@@ -1567,7 +1625,8 @@ function renderValue(d) {
       <div class="rrow"><span style="color:var(--muted)">Soft warn</span><span style="font-family:var(--mono)">$${money(bud.recommendedSoftUsd)}</span></div>
       ${bud.projectedMonthlyWasteUsd != null ? `<div class="rrow"><span style="color:var(--muted)">Projected monthly waste</span><span style="color:var(--coral);font-family:var(--mono)">$${money(bud.projectedMonthlyWasteUsd)}</span></div>` : ''}
       ${reallocs ? `<div style="margin-top:10px">${reallocs}</div>` : ''}
-      ${budgetBasisLine}`;
+      ${budgetBasisLine}
+      ${budgetEconomicLine}`;
 
   // For a live repo, disclose whether realized value was attributed only from this
   // project's own spend (the ledger is characterized by project) or fell back to the
@@ -1619,9 +1678,10 @@ function renderValue(d) {
         <div class="sub" style="color:var(--muted);font-size:12.5px">Realized efficiency <b style="color:var(--text);font-family:var(--mono)">${esc(eff)}</b> · ${cov}/4 lenses connected${srcLabel}${tip('<b>Realized efficiency</b>: the share of spend that became kept, durable value. <b>' + cov + '/4 lenses connected</b>: how much signal is connected — unconnected lenses are excluded, never guessed.')}</div>
         ${roi && roi.realizationInterval ? `<div class="sub" style="color:var(--faint);margin-top:4px;font-size:11.5px;font-family:var(--mono)">realization ${Math.round(roi.realizationInterval.low * 100)}–${Math.round(roi.realizationInterval.high * 100)}% <span style="color:var(--mint)">anytime-valid</span>${tip('A <b>confidence sequence</b>, not a classic interval. A classic interval is only valid if you look once at a pre-set sample size — but a dashboard is watched continuously, and under that use its real error rate explodes (in simulation, a 90% classic interval is wrong at some point in ~64% of runs). This one holds its guarantee <b>simultaneously at every glance</b>: peek whenever, act whenever, still valid. The honest cost is a slightly wider interval.')}</div>` : ''}
         ${d.drift ? (d.drift.alarm
-          ? `<div class="sub" style="color:var(--coral);margin-top:4px;font-size:11.5px;font-family:var(--mono)">⚠ drift detected — realization moved ${Math.round((d.drift.overallRate ?? 0) * 100)}% → ${Math.round((d.drift.recentRate ?? 0) * 100)}% recently${tip('The <b>Goodhart alarm</b>: an anytime-valid test that the realization rate is NOT stable. It detects that the rate moved, not why — a genuine regime change (new model, new workflow) and a gamed metric both trip it. Its job is to force the question no dashboard asks: <b>did the work change, or did the measuring get bent?</b> False-alarm rate is capped at 5% over all of time.')}</div>`
-          : `<div class="sub" style="color:var(--faint);margin-top:4px;font-size:11.5px;font-family:var(--mono)">stability <span style="color:var(--mint)">stable</span> — no drift in the realization stream${tip('The <b>Goodhart alarm</b> (anytime-valid): watches the realization stream for the signature of a bent metric — a rate that drifts while a constant-rate story fails. Currently quiet: the stream is consistent with one stable rate.')}</div>`) : ''}
+          ? `<div class="sub" style="color:var(--coral);margin-top:4px;font-size:11.5px;font-family:var(--mono)">⚠ drift detected — realization moved ${Math.round((d.drift.overallRate ?? 0) * 100)}% → ${Math.round((d.drift.recentRate ?? 0) * 100)}% recently${tip('The <b>drift alarm</b>: an anytime-valid test that the realization rate is NOT constant. It detects that the rate moved, not why — a genuine regime change (new model, new workflow) and a gamed metric both trip it, and this test cannot tell them apart. Its job is to force the question no dashboard asks: <b>did the work change, or did the measuring get bent?</b> Answering it takes evidence outside this stream. False-alarm rate is capped at 5% over all of time.')}</div>`
+          : `<div class="sub" style="color:var(--faint);margin-top:4px;font-size:11.5px;font-family:var(--mono)">stability <span style="color:var(--mint)">stable</span> — no drift in the realization stream${tip('The <b>drift alarm</b> (anytime-valid): watches the realization stream for a rate that drifts while a constant-rate story fails — one signature a bent metric would leave, among other causes. Currently quiet: the stream is consistent with one stable rate.')}</div>`) : ''}
         ${returnHtml}
+        ${matureEconomicLine}
       </div>
     </div>
     ${recCard}
@@ -1642,6 +1702,7 @@ function renderValue(d) {
       <div class="label">Usage without code signals · chat · research · drafting ${tip('Sessions with <b>no captured code proposals</b>. A coding session lands here too when its tool never reports diffs — route it through the proxy to move it into the git-based RoI above.')}</div>
       <div class="rrow"><span style="color:var(--muted)">RoI Index</span><span style="font-family:var(--mono);color:${uidx == null ? 'var(--faint)' : 'var(--mint)'}">${uidx == null ? 'n/a' : uidx + ' / 100'}</span></div>
       <div class="rrow"><span style="color:var(--muted)">Realized sessions</span><span style="font-family:var(--mono)">${u.realizedUnits}/${u.units.length} · $${money(u.totalCostUsd)}</span></div>
+      ${usageEconomicLine}
       <div class="lenshow">Acceptance &amp; survival are n/a here (no diff, no git) — realized = a reported, no-incident outcome. Record with: <span style="color:var(--gold)">fiscus report --session &lt;id&gt; --kind used</span></div>
     </div>
     ${teamCard}`);

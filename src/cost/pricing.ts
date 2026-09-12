@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { egressFetch, EgressError } from '../egress/transport.ts';
 import { dirname, join } from 'node:path';
 import { fiscusHome } from '../config.ts';
+import { computeExactCost, validateExactModelRate, type ExactCostBreakdown, type ExactModelRate } from './exactPricing.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -44,6 +45,10 @@ function archivePath(cardSha256: string): string {
   return join(fiscusHome(), 'pricing', 'cards', `${cardSha256}.json`);
 }
 
+function archiveProvenancePath(cardSha256: string): string {
+  return join(fiscusHome(), 'pricing', 'cards', `${cardSha256}.provenance.json`);
+}
+
 export type Provider = 'anthropic' | 'openai';
 
 export interface ModelRate {
@@ -57,6 +62,8 @@ export interface ModelRate {
   cache_write_1h?: number;
   /** USD per 1M tokens read from the prompt cache. */
   cache_read?: number;
+  /** Optional canonical decimal companion used by the exact accounting path. */
+  exact?: ExactModelRate;
 }
 
 interface PricingFile {
@@ -112,17 +119,15 @@ export interface RequestPricingEvidence {
   rateMatchModel: string | null;
 }
 
-interface PricingProvenance {
+export interface PricingCardProvenance {
   schemaVersion: 1;
   /** Safe URL identity: origin + pathname only, without credentials/query/hash. */
   sourceUrl: string | null;
   /** Hash of the full fetch target, used only locally for conditional requests. */
   sourceUrlSha256: string | null;
   sourceKind: PricingSourceKind;
-  /** When Fiscus actually accepted this rate-card content, not a provider claim. */
+  /** When Fiscus accepted this immutable card content. */
   fetchedAt: string;
-  /** Last successful conditional or full check of this source. */
-  lastCheckedAt: string;
   /** A declared native-manifest date, never inferred for a transformed feed. */
   upstreamDeclaredUpdated: string | null;
   /** SHA-256 of the normalized cached rate card. */
@@ -130,6 +135,12 @@ interface PricingProvenance {
   modelCount: number;
   etag: string | null;
   lastModified: string | null;
+}
+
+interface PricingProvenance extends PricingCardProvenance {
+  schemaVersion: 1;
+  /** Last successful conditional or full check of this source. */
+  lastCheckedAt: string;
 }
 
 export const MAX_PRICING_MANIFEST_BYTES = 5 * 1024 * 1024;
@@ -163,6 +174,8 @@ export interface CostBreakdown {
     cacheWrite: number;
     cacheRead: number;
   };
+  /** Present only when the active rate card carries canonical decimal rates. */
+  exact?: ExactCostBreakdown;
 }
 
 let cached: PricingFile | null = null;
@@ -224,6 +237,13 @@ function pricingValidationError(obj: unknown): string | null {
       for (const key of ['cache_write_5m', 'cache_write_1h', 'cache_read']) {
         if (rate[key] !== undefined && !validRate(rate[key])) return `model ${model} has an invalid ${key} rate`;
       }
+      if (rate['exact'] !== undefined) {
+        try {
+          validateExactModelRate(rate['exact'] as ExactModelRate);
+        } catch (error) {
+          return `model ${model} has an invalid exact rate: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      }
       modelCount += 1;
     }
   }
@@ -252,6 +272,35 @@ function isValidProvenance(obj: unknown): obj is PricingProvenance {
   );
 }
 
+function isSha256(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+}
+
+function isValidCardProvenance(obj: unknown, expectedCardSha256: string): obj is PricingCardProvenance {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj) || !isSha256(expectedCardSha256)) return false;
+  const p = obj as Record<string, unknown>;
+  const keys = new Set([
+    'schemaVersion', 'sourceUrl', 'sourceUrlSha256', 'sourceKind', 'fetchedAt',
+    'upstreamDeclaredUpdated', 'cardSha256', 'modelCount', 'etag', 'lastModified',
+  ]);
+  if (Object.keys(p).some((key) => !keys.has(key))) return false;
+  const sourceUrl = p['sourceUrl'];
+  const sourceUrlSha256 = p['sourceUrlSha256'];
+  return (
+    p['schemaVersion'] === 1 &&
+    p['cardSha256'] === expectedCardSha256 &&
+    (sourceUrl === null || typeof sourceUrl === 'string') &&
+    (sourceUrlSha256 === null || isSha256(sourceUrlSha256)) &&
+    (sourceUrl !== null || sourceUrlSha256 === null) &&
+    (p['sourceKind'] === 'manual' || p['sourceKind'] === 'native_manifest' || p['sourceKind'] === 'litellm_transformed') &&
+    validTimestamp(p['fetchedAt']) &&
+    (p['upstreamDeclaredUpdated'] === null || validTimestamp(p['upstreamDeclaredUpdated'])) &&
+    typeof p['modelCount'] === 'number' && Number.isSafeInteger(p['modelCount']) && p['modelCount'] > 0 &&
+    (p['etag'] === null || typeof p['etag'] === 'string') &&
+    (p['lastModified'] === null || typeof p['lastModified'] === 'string')
+  );
+}
+
 function readProvenance(): PricingProvenance | null {
   try {
     const value: unknown = JSON.parse(readFileSync(provenancePath(), 'utf8'));
@@ -268,6 +317,24 @@ function readValidPricing(path: string): PricingFile | null {
   } catch {
     return null;
   }
+}
+
+function readCardProvenance(cardSha256: string): PricingCardProvenance | null {
+  if (!isSha256(cardSha256)) return null;
+  try {
+    const value: unknown = JSON.parse(readFileSync(archiveProvenancePath(cardSha256), 'utf8'));
+    if (!isValidCardProvenance(value, cardSha256)) return null;
+    const archived = readValidPricing(archivePath(cardSha256));
+    if (!archived || pricingCardHash(archived) !== cardSha256 || countModels(archived) !== value.modelCount) return null;
+    return Object.freeze({ ...value });
+  } catch {
+    return null;
+  }
+}
+
+/** Read immutable provenance for a hash-addressed archived pricing card. */
+export function pricingCardProvenance(cardSha256: string): PricingCardProvenance | null {
+  return readCardProvenance(cardSha256);
 }
 
 function countModels(file: PricingFile): number {
@@ -510,9 +577,32 @@ export function applyPricingManifest(rawText: string, options: ApplyPricingOptio
     const archiveDir = join(dir, 'cards');
     if (!existsSync(archiveDir)) mkdirSync(archiveDir, { recursive: true });
     const cardText = JSON.stringify(file, null, 2) + '\n';
+    const archivedCardPath = archivePath(cardSha256);
+    const archivedCardExists = existsSync(archivedCardPath);
+    if (archivedCardExists) {
+      const archived = readValidPricing(archivedCardPath);
+      if (!archived || pricingCardHash(archived) !== cardSha256) {
+        return { ok: false, error: 'existing pricing-card archive failed integrity; refusing overwrite' };
+      }
+    }
     // Archive first: a later interrupted active-cache write still has a named,
     // immutable last-valid card. All files are individually temp+rename writes.
-    if (!existsSync(archivePath(cardSha256))) writeAtomically(archivePath(cardSha256), cardText);
+    if (!archivedCardExists) {
+      writeAtomically(archivedCardPath, cardText);
+      const cardProvenance: PricingCardProvenance = {
+        schemaVersion: 1,
+        sourceUrl: provenance.sourceUrl,
+        sourceUrlSha256: provenance.sourceUrlSha256,
+        sourceKind: provenance.sourceKind,
+        fetchedAt: provenance.fetchedAt,
+        upstreamDeclaredUpdated: provenance.upstreamDeclaredUpdated,
+        cardSha256: provenance.cardSha256,
+        modelCount: provenance.modelCount,
+        etag: provenance.etag,
+        lastModified: provenance.lastModified,
+      };
+      writeAtomically(archiveProvenancePath(cardSha256), JSON.stringify(cardProvenance, null, 2) + '\n');
+    }
     writeAtomically(cachePath(), cardText);
     writeAtomically(provenancePath(), JSON.stringify(provenance, null, 2) + '\n');
   } catch (e) {
@@ -701,6 +791,8 @@ export interface PricingStatus {
   sourceUrl: string | null;
   sourceKind: PricingSourceKind | 'bundled' | 'legacy_unknown';
   cardSha256: string;
+  /** Immutable provenance sidecar for the active hash-addressed card, if present. */
+  cardProvenance: PricingCardProvenance | null;
 }
 
 /** Where the active table came from, how old it is, and whether it's stale. */
@@ -727,6 +819,7 @@ export function pricingStatus(maxAgeDays = 30): PricingStatus {
     sourceUrl: cachedProvenance?.sourceUrl ?? null,
     sourceKind: cachedSource === 'bundled' ? 'bundled' : cachedProvenance?.sourceKind ?? 'legacy_unknown',
     cardSha256: pricingCardHash(file),
+    cardProvenance: verified && provenance !== null ? readCardProvenance(provenance.cardSha256) : null,
   };
 }
 
@@ -852,6 +945,11 @@ export function rateFor(provider: Provider, model: string): ResolvedRate {
   return resolved(pricing.fallbacks.unknown, 'fallback', null, null);
 }
 
+/** Return the explicit decimal companion, if this rate card provides one. */
+export function exactRateFromModelRate(rate: ModelRate): ExactModelRate | null {
+  return rate.exact === undefined ? null : validateExactModelRate(rate.exact);
+}
+
 function per(tokens: number, rate: number | undefined): number {
   if (!tokens || !rate) return 0;
   return (tokens / 1_000_000) * rate;
@@ -880,5 +978,9 @@ export function computeCost(provider: Provider, model: string, usage: Normalized
   const costUsd =
     components.input + components.output + components.cacheWrite + components.cacheRead;
 
-  return { costUsd, estimated, pricing, rate, components };
+  const exactRate = exactRateFromModelRate(rate);
+  const exact = exactRate === null
+    ? undefined
+    : computeExactCost(exactRate, usage, estimated ? 'estimated' : 'list');
+  return { costUsd, estimated, pricing, rate, components, ...(exact === undefined ? {} : { exact }) };
 }

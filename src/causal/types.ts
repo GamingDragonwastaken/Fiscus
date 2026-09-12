@@ -1,3 +1,5 @@
+import type { EstimandDefinition } from './estimand.ts';
+
 /**
  * Canonical local evidence records for Fiscus's randomized causal-study lane.
  *
@@ -116,6 +118,25 @@ export interface CausalAnalysisPlan {
   confidenceLevel: number;
   minCompletedPerArm: number;
   maxMissingFractionPerArm: number;
+  /** Optional immutable joint-decision rule; absent on legacy protocols. */
+  jointInference?: CausalJointInferencePlan;
+}
+
+export type CausalJointEndpointFamily = 'cost_quality' | 'net_benefit';
+
+/** Pre-registered multiplicity rule for a consequential causal decision. */
+export interface CausalJointInferencePlan {
+  method: 'bonferroni';
+  endpointFamily: CausalJointEndpointFamily;
+  endpointCount: 1 | 2;
+  /** Bonferroni alpha is split equally across the registered endpoints. */
+  alphaAllocation: 'equal';
+  /** The pre-registered quality non-inferiority margin consumed by the rule. */
+  nonInferiorityMargin: number;
+  /** Minimum USD superiority required by the cost endpoint (zero = any strict saving). */
+  costSuperiorityThresholdUsd: number;
+  /** Secondary endpoints are never silently promoted into the decision family. */
+  secondaryEndpointPolicy: 'none' | 'descriptive_only';
 }
 
 export interface CausalEligibility {
@@ -209,6 +230,8 @@ export interface CausalAnalysisPlanV2 {
   minCompletedPerArm: number;
   maxMissingFractionPerArm: number;
   exclusionPolicyId: string;
+  /** Optional immutable joint-decision rule; absent on legacy protocols. */
+  jointInference?: CausalJointInferencePlan;
 }
 
 export interface CausalDataGovernanceV2 {
@@ -589,15 +612,27 @@ export interface CausalEffectInterval {
 export interface CausalStudyEstimate {
   qualification: CausalQualification;
   protocolHash: string;
+  /** Canonical registry reference; null means the protocol estimand is unknown. */
+  estimandId: EstimandDefinition['id'] | null;
+  estimandDefinition: EstimandDefinition | null;
   costEffectUsd: CausalEffectInterval | null;
   qualityEffect: CausalEffectInterval | null;
   netBenefitEffectUsd: CausalEffectInterval | null;
   qualityNonInferiorityPassed: boolean | null;
   lowerCostPassed: boolean | null;
   causalNetBenefitSupported: boolean | null;
+  jointInference: CausalJointInferenceResult;
   allowedClaim:
     | 'not_established'
     | 'comparative_cost_quality_supported'
     | 'causal_net_benefit_supported';
   limitations: string[];
+}
+
+/** The rule actually consumed by the estimator, including its endpoint level. */
+export interface CausalJointInferenceResult extends CausalJointInferencePlan {
+  overallConfidenceLevel: number;
+  endpointConfidenceLevel: number;
+  endpointAlpha: number;
+  ruleSource: 'protocol' | 'version_default';
 }

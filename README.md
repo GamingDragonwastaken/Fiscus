@@ -221,7 +221,7 @@ fiscus exec -- <command>     AMBIENT outcome capture — wrap a command once (e.
                                 `npm test`); every run reports its own exit code
 fiscus receipt --repo <path> Emit signed value receipts (--pubkey to publish your
                                 identity; --verify <file> --key-id <id> to verify + pin)
-fiscus yield --repo <path>   AI Yield (survival lens) — durable lines per $
+fiscus yield --repo <path>   Artifact persistence (legacy yield lens) — retained introduced lines per $
 fiscus budget ...            Set caps (see below)
 fiscus audit --repo <path>   Cost per commit from git history (--limit N, --json)
 ```
@@ -446,10 +446,12 @@ fiscus receipt --repo .            # emit signed value receipts
 ```
 
 The full model is in **[docs/THE-STANDARD.md](docs/THE-STANDARD.md)**. The older
-**AI Yield** (`fiscus yield`) survives as one *lens* — durable lines per
-dollar — but the Standard, not Yield, is the headline. The honest account of why
-the research's "AI Efficiency Score" and our own first Yield-only attempt were
-both rebuilt is in [docs/RESEARCH-REVIEW.md §3](docs/RESEARCH-REVIEW.md).
+**AI Yield** (`fiscus yield`) remains as a compatibility command for one
+*artifact-persistence lens* — retained introduced lines per dollar. It is not a
+quality grade and does not establish correctness, maintainability, business
+value, or AI/human contribution. The Standard, not this lens, is the headline.
+The historical account of why the research's "AI Efficiency Score" and our own
+first Yield-only attempt were rebuilt is in [docs/RESEARCH-REVIEW.md §3](docs/RESEARCH-REVIEW.md).
 
 ## Budget controls and model trials
 
@@ -489,10 +491,12 @@ product surfaces because model/task and project cells can be unlike work. -->
   attribution window it worked in: a unit whose window is more than 20% other
   models cannot price a single model, so it is excluded — and the excluded count
   is reported alongside the result rather than quietly shrinking the sample.
-  A result is labelled **evidence-supported** only when the anytime-valid outcome
-  bounds separate *and* that separation survives one outcome flipping the wrong
-  way on each side; anything resting on a single observation stays a **trial**,
-  not a proven switch. It never changes routing.
+  A result is labelled **observational separation** only when the anytime-valid
+  outcome bounds separate *and* that separation survives one outcome flipping the
+  wrong way on each side; anything resting on a single observation stays a
+  **trial**, not a proven switch. Neither label is causal evidence — models are
+  not assigned, so a separation describes the observed comparison, not the
+  models. It never changes routing.
 - **It says when a comparison is confounded.** Cost-per-unit is blind to how big
   each unit was, so if the two models' median changed lines differ by more than
   2×, "cheaper" may just mean "smaller work" — that is named on the result and

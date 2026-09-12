@@ -73,6 +73,20 @@ and open-ended free-text payloads in the protocol's structural context. The
 protocol stores declared identifiers and hashes, not a hidden copy of sensitive
 input material.
 
+### Canonical estimand registry (WP-E01)
+
+The bounded `src/causal/estimand.ts` registry currently defines one canonical
+estimand: `randomized_itt`. It records the registered eligible population,
+assigned-arm intervention and comparator, pre-registered primary outcome,
+registered study window, difference-in-means contrast, and explicit missingness
+treatment. The registry is immutable. Every produced v1 `CausalStudyEstimate`
+and causal kernel issuance carries the registered ID and definition, while the
+legacy `analysis.estimand: "intention_to_treat"` field remains unchanged for
+protocol/hash compatibility. The claim values issued by the causal adapter carry
+the same reference. An unsupported runtime estimand is reported with an unknown
+(`null`) registry reference and cannot be issued into the kernel; no ID is
+inferred. Protocol decoding and additional estimands remain outside this slice.
+
 ### Additive protocol version 2
 
 Protocol v2 is a new canonical document; it does not reinterpret or silently
@@ -155,6 +169,23 @@ with an intention-to-treat headline. Every result must include the point
 estimate, confidence interval, arm counts, completion/missingness/adherence
 table, quality result, cost source classification, protocol hash, and exact
 result state. Fiscus does not turn a p-value alone into a winner badge.
+
+For the `model_cost_quality` conjunction, the registered analysis plan uses a
+family-wise confidence level: the overall alpha is split equally across the cost
+and quality endpoints with a Bonferroni rule, so a 95% study reports 97.5%
+component bounds rather than incorrectly AND-ing two independent 95% intervals.
+An explicit `analysis.jointInference` records the method, equal alpha allocation,
+endpoint family/count, the exact non-inferiority margin, the minimum USD cost
+superiority threshold, and whether secondary endpoints are absent or descriptive
+only. Those values are committed with the protocol and cannot be changed after
+outcomes exist. Older version-1 protocols retain their original hash and receive
+the same deterministic version default, disclosed in the estimate. For
+`ai_vs_incumbent_net_benefit`, the direct net-benefit estimand is the one endpoint
+governing the causal claim; quality and cost are reported context, not silently
+added to the family. The overall level, component level, allocation, endpoint
+family/count, thresholds, secondary-endpoint treatment and rule source are
+returned in the estimate, CLI and dashboard status. A passing cost or quality
+endpoint alone never authorizes the conjunction.
 
 Quasi-experimental designs may later be supported, but are not a default
 shortcut. A difference-in-differences result must surface its parallel-trends,
