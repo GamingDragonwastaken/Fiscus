@@ -16,7 +16,7 @@
  */
 
 import { h } from '../core/dom.ts';
-import { signal, effect } from '../core/signal.ts';
+import { signal, scopedEffect } from '../core/signal.ts';
 import { api, type AllocationPayload } from '../core/api.ts';
 import { isPrecise, relative, count } from '../core/fmt.ts';
 import { actionCard } from './spend.ts';
@@ -33,7 +33,7 @@ export function allocationView(): Node {
   const data = signal<AllocationPayload | null>(null);
   const error = signal<string | null>(null);
 
-  effect(() => {
+  scopedEffect(() => {
     void api.allocation()
       .then((payload) => data.set(payload))
       .catch((e: unknown) => error.set(e instanceof Error ? e.message : String(e)));
@@ -48,9 +48,9 @@ export function allocationView(): Node {
 
     () => {
       const err = error();
-      if (err) return h('div', { class: 'card' }, h('p', { class: 'drawer-error', text: err }));
+      if (err) return h('div', { class: 'card' }, h('p', { class: 'drawer-error', role: 'alert', 'aria-live': 'assertive', text: err }));
       const d = data();
-      if (!d) return h('div', { class: 'card' }, h('p', { class: 'drawer-muted', text: 'Loading…' }));
+      if (!d) return h('div', { class: 'card' }, h('p', { class: 'drawer-muted', role: 'status', 'aria-live': 'polite', 'aria-busy': 'true', text: 'Loading…' }));
 
       const centres = d.costCentres ?? [];
       const rules = d.rules ?? [];

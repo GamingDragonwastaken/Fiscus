@@ -20,8 +20,8 @@
  * three rows uses the same gate as `prune` deleting three hundred thousand.
  */
 
-import { h, render, trapFocus } from '../core/dom.ts';
-import { signal, effect } from '../core/signal.ts';
+import { h, render, captureFocus, restoreFocus, trapFocus, type FocusTarget } from '../core/dom.ts';
+import { signal, effect, onCleanup } from '../core/signal.ts';
 import { isPrecise } from '../core/fmt.ts';
 import type { Capability, Consequence } from '../core/registry.ts';
 
@@ -52,20 +52,25 @@ export interface ActionSpec {
 
 const CONSEQUENCE_COPY: Record<Consequence, { badge: string; plain: string; tone: string }> = {
   read: { badge: 'reads only', plain: 'This looks at your data. It changes nothing.', tone: 'calm' },
-  local: { badge: 'writes locally', plain: 'This writes to the ledger on this machine. Nothing leaves your device.', tone: 'local' },
+  local: { badge: 'writes locally', plain: 'This action writes to the ledger on this machine. It does not itself send data to another service.', tone: 'local' },
   credential: { badge: 'uses a credential', plain: 'This reads a provider credential and contacts the provider.', tone: 'warn' },
   egress: { badge: 'sends data off this machine', plain: 'This transmits data to a server you configured.', tone: 'warn' },
   destructive: { badge: 'cannot be undone', plain: 'This permanently changes or deletes recorded data.', tone: 'danger' },
 };
 
 const open = signal<ActionSpec | null>(null);
+let opener: FocusTarget | null = null;
 
 export function openAction(spec: ActionSpec): void {
+  if (open.peek() === null) opener = captureFocus(document.activeElement as FocusTarget | null);
   open.set(spec);
 }
 
 export function closeAction(): void {
   open.set(null);
+  const previous = opener;
+  opener = null;
+  restoreFocus(previous);
 }
 
 export function mountDrawer(root: HTMLElement): void {
@@ -251,11 +256,9 @@ function panel(spec: ActionSpec): Node {
   queueMicrotask(() => (body as HTMLElement).focus());
   (body as HTMLElement).tabIndex = -1;
 
-  effect(() => {
-    if (open() === null) {
-      release();
-      document.removeEventListener('keydown', onKey);
-    }
+  onCleanup(() => {
+    release();
+    document.removeEventListener('keydown', onKey);
   });
 
   return h('div', { class: 'drawer-wrap' }, scrim, body);

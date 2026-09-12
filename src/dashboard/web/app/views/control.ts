@@ -29,7 +29,7 @@
  */
 
 import { h } from '../core/dom.ts';
-import { signal, effect } from '../core/signal.ts';
+import { signal, scopedEffect } from '../core/signal.ts';
 import { api, type SettingsSnapshot, type Overview, type ValuePayload, type AlertRow } from '../core/api.ts';
 import { usd, count, pct, isPrecise } from '../core/fmt.ts';
 import { actionCard } from './spend.ts';
@@ -40,7 +40,7 @@ export function controlView(): Node {
   const advice = signal<ValuePayload['budget'] | null>(null);
   const error = signal<string | null>(null);
 
-  effect(() => {
+  scopedEffect(() => {
     void Promise.allSettled([api.settings(), api.overview('today'), api.value()])
       .then(([s, o, v]) => {
         if (s.status === 'fulfilled') settings.set(s.value);
@@ -61,9 +61,9 @@ export function controlView(): Node {
 
     () => {
       const err = error();
-      if (err) return h('div', { class: 'card' }, h('p', { class: 'drawer-error', text: err }));
+      if (err) return h('div', { class: 'card' }, h('p', { class: 'drawer-error', role: 'alert', 'aria-live': 'assertive', text: err }));
       const s = settings();
-      if (!s) return h('div', { class: 'card' }, h('p', { class: 'drawer-muted', text: 'Loading…' }));
+      if (!s) return h('div', { class: 'card' }, h('p', { class: 'drawer-muted', role: 'status', 'aria-live': 'polite', 'aria-busy': 'true', text: 'Loading…' }));
 
       const budget = s.budget;
       const enforcement = s.enforcement;

@@ -22,9 +22,13 @@ import { cmdEvidence } from './cli/evidenceCmd.ts';
 import { cmdYield, cmdRealize, cmdReport, cmdExec, cmdUsage, cmdRoi, cmdSaved, cmdBudgetAdvisor, cmdFrontier } from './cli/valueCmd.ts';
 import { cmdTeam, cmdReceipt, cmdJudge, cmdTeamPush } from './cli/teamCmd.ts';
 import { cmdConnect } from './cli/connectCmd.ts';
+import { cmdEgress } from './cli/egressCmd.ts';
+import { cmdCausal } from './cli/causalCmd.ts';
 import { cmdAlerts, cmdDoctor, cmdInit, cmdGuide, cmdAudit } from './cli/opsCmd.ts';
 import { cmdShow, cmdSources, cmdExport, cmdConfig, cmdBudget, cmdPrune, cmdProject } from './cli/showCmd.ts';
 import { cmdStart, cmdDemo, cmdPricing, cmdBaseline, cmdReprice } from './cli/runCmd.ts';
+import { cmdBackup, cmdRestore } from './cli/backupCmd.ts';
+import { cmdDiagnostics } from './cli/diagnosticsCmd.ts';
 
 function cmdHelp(): void {
   console.log(`
@@ -36,6 +40,17 @@ function cmdHelp(): void {
     guide                 Where you are + the single next step, read from your
                           actual state — also what bare "fiscus" shows (--json)
     start                 Start the proxy + local dashboard
+    egress                Inspect/verify Fiscus-process egress; plan exact cloud
+                          rules without mutation, then persist only with:
+                          egress apply --apply --mode controlled_cloud
+                          (--id, --purpose, --data-class, --method, --origin,
+                          --path-prefix). Default local_locked permits literal
+                          loopback only; this is not a machine-wide firewall.
+    causal                Retained randomized-study evidence: status, inspect,
+                          and replay verification. V1 is inspect-only; all causal
+                          mutations and v2 public projection remain deferred.
+                          Ordinary value, Lift, and price scenarios cannot become
+                          causal claims; this command never changes provider routing.
     today | week | month  Show spend for a window      (--json)
     sources               Spend by connected source — each AI tool routed here
                           (--all for all-time, --json)
@@ -146,6 +161,12 @@ function cmdHelp(): void {
                           by the tool, inferred from its recorded path, or never
                           attributed at all — an assertion, never verified identity
     prune                 Prune old rows and compact the database
+    backup --out <file>   Create a verified, local SQLite ledger snapshot
+    restore --from <file> --out <file>
+                          Preview a backup, or create a new verified database
+                          with --apply. The active ledger is never overwritten.
+    diagnostics [--json]   Emit redacted local runtime/database/egress diagnostics
+                          (--out <file> writes an atomic bundle; no telemetry)
     demo                  Generate isolated, clearly-labeled synthetic data so every
                           surface populates without an API key (--serve to launch the
                           dashboard on it; --clear to remove). Add --demo to any read
@@ -154,10 +175,17 @@ function cmdHelp(): void {
     --version             Print the Fiscus version
 
   Setup
-    1) fiscus start
-    2) $env:ANTHROPIC_BASE_URL="http://localhost:8090"   (PowerShell)
+    1) If routing a cloud provider, review its exact rule first:
+       fiscus egress plan --mode controlled_cloud --id openai-inference
+         --purpose provider_inference --data-class provider_request --method POST
+         --origin https://api.openai.com --path-prefix /v1/
+       Persist the reviewed plan only with the same command as:
+         fiscus egress apply --apply ...
+       (Skip this for a local loopback-only model.)
+    2) fiscus start
+    3) $env:ANTHROPIC_BASE_URL="http://localhost:8090"   (PowerShell)
        $env:OPENAI_BASE_URL="http://localhost:8090/v1"
-    3) Run your AI tools as usual. Watch the dashboard.
+    4) Run your AI tools as usual. Watch the dashboard.
 
   Any OpenAI-compatible provider works through the OpenAI path — point your tool
   at http://localhost:8090/v1. Gemini, for example, via Google's free tier:
@@ -211,6 +239,13 @@ async function main(): Promise<void> {
       break;
     case 'connect':
       cmdConnect(flags);
+      break;
+    case 'egress':
+      cmdEgress(flags);
+      break;
+    case 'causal':
+    case 'study':
+      cmdCausal(flags);
       break;
     case 'init':
       cmdInit();
@@ -307,6 +342,16 @@ async function main(): Promise<void> {
       break;
     case 'prune':
       cmdPrune();
+      break;
+    case 'backup':
+      cmdBackup(flags);
+      break;
+    case 'restore':
+      cmdRestore(flags);
+      break;
+    case 'diagnostics':
+    case 'diagnostic':
+      cmdDiagnostics(flags);
       break;
     case 'pricing':
       await cmdPricing(flags);

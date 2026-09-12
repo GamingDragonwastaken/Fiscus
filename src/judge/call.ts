@@ -14,6 +14,7 @@
 import type { JudgeConfidence } from './tier.ts';
 import type { StructuralSessionSummary } from './payload.ts';
 import type { TranscriptExcerpt } from './transcript.ts';
+import { egressFetch, EgressError, type EgressErrorCode } from '../egress/transport.ts';
 
 export interface SessionJudgment {
   sessionId: string;
@@ -23,12 +24,18 @@ export interface SessionJudgment {
 }
 
 export class JudgeCallError extends Error {
-  readonly reason: 'network' | 'timeout' | 'http-status' | 'malformed-response';
+  readonly reason: 'network' | 'timeout' | 'http-status' | 'malformed-response' | 'egress-boundary';
+  readonly egressCode?: EgressErrorCode;
 
-  constructor(message: string, reason: 'network' | 'timeout' | 'http-status' | 'malformed-response') {
+  constructor(
+    message: string,
+    reason: 'network' | 'timeout' | 'http-status' | 'malformed-response' | 'egress-boundary',
+    egressCode?: EgressErrorCode,
+  ) {
     super(message);
     this.name = 'JudgeCallError';
     this.reason = reason;
+    this.egressCode = egressCode;
   }
 }
 
@@ -105,13 +112,16 @@ export async function callJudgeApi(
   confidence: JudgeConfidence,
   timeoutMs = CALL_TIMEOUT_MS,
   transcript: TranscriptExcerpt | null = null,
+  purpose: 'local_judge' | 'hosted_judge' = 'local_judge',
 ): Promise<SessionJudgment> {
   const controller = new AbortController();
   const timeoutTimer = setTimeout(() => controller.abort(), timeoutMs);
 
   let res: Response;
   try {
-    res = await fetch(baseUrl.replace(/\/$/, '') + '/chat/completions', {
+    res = await egressFetch(baseUrl.replace(/\/$/, '') + '/chat/completions', {
+      purpose,
+      dataClass: transcript ? 'judge_transcript_excerpt' : 'judge_structural_summary',
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -127,6 +137,16 @@ export async function callJudgeApi(
     });
   } catch (err) {
     const timedOut = controller.signal.aborted;
+    if (err instanceof EgressError && err.code !== 'transport_failed') {
+      const repair = err.code === 'receipt_integrity_failed' || err.code === 'receipt_persistence_failed'
+        ? '; repair/restore the local receipt history before retrying'
+        : '';
+      throw new JudgeCallError(
+        `Fiscus egress boundary refused the judge request (${err.code}): ${err.message}${repair}`,
+        'egress-boundary',
+        err.code,
+      );
+    }
     throw new JudgeCallError(
       timedOut ? `judge call timed out after ${timeoutMs}ms` : `judge endpoint unreachable: ${String(err)}`,
       timedOut ? 'timeout' : 'network',

@@ -8,6 +8,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { egressFetch, EgressError } from '../egress/transport.ts';
 import type { ProviderScopeDeclaration } from './scope.ts';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -60,6 +61,11 @@ export type OpenAiCostsFailureCode =
   | 'missing_credential'
   | 'timeout'
   | 'network_error'
+  | 'egress_policy_denied'
+  | 'egress_dns_denied'
+  | 'egress_receipt_integrity_failed'
+  | 'egress_receipt_persistence_failed'
+  | 'egress_transport_failed'
   | 'response_too_large'
   | 'malformed_response'
   | 'pagination_loop'
@@ -79,7 +85,10 @@ export class OpenAiCostsPullError extends Error {
   readonly failure: OpenAiCostsFailedPull;
 
   constructor(failure: OpenAiCostsFailedPull) {
-    super(`OpenAI Organization Costs observation failed (${failure.failureCode})`);
+    const repair = failure.failureCode === 'egress_receipt_integrity_failed' || failure.failureCode === 'egress_receipt_persistence_failed'
+      ? '; repair/restore the local receipt history before retrying'
+      : '';
+    super(`OpenAI Organization Costs observation failed (${failure.failureCode})${repair}`);
     this.name = 'OpenAiCostsPullError';
     this.failure = failure;
   }
@@ -270,6 +279,7 @@ function digestChain(previous: string | null, body: Uint8Array): string {
 
 function failureCode(error: unknown): OpenAiCostsFailureCode {
   if (error instanceof OpenAiCostsPullError) return error.failure.failureCode;
+  if (error instanceof EgressError) return `egress_${error.code}` as OpenAiCostsFailureCode;
   if (error instanceof Error && /^http_\d{3}$/.test(error.message)) return error.message as OpenAiCostsFailureCode;
   if (error instanceof Error && error.name === 'TimeoutError') return 'timeout';
   if (error instanceof Error && error.name === 'AbortError') return 'timeout';
@@ -290,16 +300,13 @@ async function responseBytes(response: Response): Promise<Uint8Array> {
   return bytes;
 }
 
-/**
- * Execute exactly one allowlisted GET-only Costs pull. The caller owns database
- * recording, which makes it possible to retain a failed run without ever
- * retaining a raw body or an API key.
- */
-export async function pullOpenAiCosts(input: {
+type OpenAiCostsTransport = (url: URL, init: Parameters<typeof egressFetch>[1]) => Promise<Response>;
+
+async function pullOpenAiCostsWithTransport(input: {
   preview: OpenAiCostsPreview;
   apiKey: string;
-  fetchImpl?: typeof fetch;
   now?: () => number;
+  transport: OpenAiCostsTransport;
 }): Promise<OpenAiCostsCollected> {
   const fetchedAtMs = (input.now ?? Date.now)();
   let pageCount = 0;
@@ -307,7 +314,6 @@ export async function pullOpenAiCosts(input: {
   const observations: OpenAiCostObservation[] = [];
   let page: string | null = null;
   const cursors = new Set<string>();
-  const fetchImpl = input.fetchImpl ?? fetch;
   try {
     while (true) {
       if (page !== null) {
@@ -316,10 +322,11 @@ export async function pullOpenAiCosts(input: {
       }
       if (pageCount >= MAX_OPENAI_COST_PAGES) throw new Error('partial_response');
       const url = requestUrl(input.preview, page);
-      const response = await fetchImpl(url, {
+      const response = await input.transport(url, {
+        purpose: 'provider_cost_observation',
+        dataClass: 'provider_cost_aggregate',
         method: 'GET',
-        headers: { Authorization: `Bearer ${input.apiKey}`, Accept: 'application/json' },
-        redirect: 'error',
+        headers: { Authorization: 'Bearer ' + input.apiKey, Accept: 'application/json' },
         signal: AbortSignal.timeout(30_000),
       });
       if (!response.ok) throw new Error(`http_${response.status}`);
@@ -361,4 +368,40 @@ export async function pullOpenAiCosts(input: {
       failureCode: failureCode(error),
     });
   }
+}
+
+/**
+ * Execute exactly one allowlisted GET-only Costs pull. The caller owns database
+ * recording, which makes it possible to retain a failed run without ever
+ * retaining a raw body or an API key.
+ */
+export async function pullOpenAiCosts(input: {
+  preview: OpenAiCostsPreview;
+  apiKey: string;
+  now?: () => number;
+}): Promise<OpenAiCostsCollected> {
+  return pullOpenAiCostsWithTransport({ ...input, transport: egressFetch });
+}
+
+/**
+ * Network-free response fixture seam. It accepts already-created Response
+ * objects for parser/pagination tests; production pulls have no transport
+ * override and always use egressFetch above.
+ */
+export async function collectOpenAiCostsFromResponses(input: {
+  preview: OpenAiCostsPreview;
+  responses: readonly Response[];
+  now?: () => number;
+}): Promise<OpenAiCostsCollected> {
+  let index = 0;
+  return pullOpenAiCostsWithTransport({
+    preview: input.preview,
+    apiKey: 'fixture-key',
+    now: input.now,
+    transport: async () => {
+      const response = input.responses[index++];
+      if (!response) throw new Error('fixture_response_sequence_exhausted');
+      return response;
+    },
+  });
 }
