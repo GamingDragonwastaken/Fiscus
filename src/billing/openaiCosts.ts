@@ -10,12 +10,16 @@
 import { createHash } from 'node:crypto';
 import { egressFetch, EgressError } from '../egress/transport.ts';
 import type { ProviderScopeDeclaration } from './scope.ts';
+import { OPENAI_COSTS_EXCLUDED_FLOOR } from './epistemic.ts';
+import type { ClaimUse } from '../epistemic/claim-uses.ts';
+import { readBoundedResponseBytes, ResourceLimitError } from '../util/resource-limits.ts';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 export const OPENAI_COSTS_ENDPOINT = 'https://api.openai.com/v1/organization/costs';
 export const MAX_OPENAI_COST_DAYS = 180;
 export const MAX_OPENAI_COST_PAGES = 64;
 export const MAX_OPENAI_COST_PAGE_BYTES = 2 * 1024 * 1024;
+export const MAX_OPENAI_COST_OBSERVATIONS = 100_000;
 
 export interface OpenAiCostsRange {
   from: string;
@@ -34,7 +38,7 @@ export interface OpenAiCostsPreview {
   providerFinality: 'undocumented';
   rawRetention: 'digest_only';
   requestLedgerIncluded: false;
-  excludedFrom: readonly ['request_metered_spend', 'budget_enforcement', 'roi', 'model_recommendations'];
+  excludedFrom: readonly ClaimUse[];
 }
 
 /** A single returned provider daily cost grouping. Amounts are never summed here. */
@@ -149,7 +153,7 @@ export function previewOpenAiCosts(scope: ProviderScopeDeclaration | null, from:
     providerFinality: 'undocumented',
     rawRetention: 'digest_only',
     requestLedgerIncluded: false,
-    excludedFrom: ['request_metered_spend', 'budget_enforcement', 'roi', 'model_recommendations'],
+    excludedFrom: OPENAI_COSTS_EXCLUDED_FLOOR,
   };
 }
 
@@ -283,6 +287,7 @@ function failureCode(error: unknown): OpenAiCostsFailureCode {
   if (error instanceof Error && /^http_\d{3}$/.test(error.message)) return error.message as OpenAiCostsFailureCode;
   if (error instanceof Error && error.name === 'TimeoutError') return 'timeout';
   if (error instanceof Error && error.name === 'AbortError') return 'timeout';
+  if (error instanceof ResourceLimitError && error.kind === 'openai_cost_page_bytes') return 'response_too_large';
   if (error instanceof Error && /^response_too_large$/.test(error.message)) return 'response_too_large';
   if (error instanceof Error && /^pagination_loop$/.test(error.message)) return 'pagination_loop';
   if (error instanceof Error && /^partial_response$/.test(error.message)) return 'partial_response';
@@ -291,13 +296,12 @@ function failureCode(error: unknown): OpenAiCostsFailureCode {
 }
 
 async function responseBytes(response: Response): Promise<Uint8Array> {
-  const contentLength = response.headers.get('content-length');
-  if (contentLength !== null && (!/^\d+$/.test(contentLength) || Number(contentLength) > MAX_OPENAI_COST_PAGE_BYTES)) {
-    throw new Error('response_too_large');
+  try {
+    return await readBoundedResponseBytes(response, MAX_OPENAI_COST_PAGE_BYTES, 'openai_cost_page_bytes');
+  } catch (error) {
+    if (error instanceof ResourceLimitError) throw error;
+    throw error;
   }
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength > MAX_OPENAI_COST_PAGE_BYTES) throw new Error('response_too_large');
-  return bytes;
 }
 
 type OpenAiCostsTransport = (url: URL, init: Parameters<typeof egressFetch>[1]) => Promise<Response>;
@@ -344,6 +348,9 @@ async function pullOpenAiCostsWithTransport(input: {
         parsed = parseOpenAiCostsPage(body, input.preview);
       } catch {
         throw new Error('malformed_response');
+      }
+      if (observations.length + parsed.observations.length > MAX_OPENAI_COST_OBSERVATIONS) {
+        throw new Error('response_too_large');
       }
       observations.push(...parsed.observations);
       if (!parsed.hasMore) {

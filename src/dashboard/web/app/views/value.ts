@@ -108,6 +108,86 @@ function causalStudyCard(payload: CausalPayload | null, failure: string | null):
     h('p', { class: 'drawer-muted', role: 'note', text: payload.boundary }));
 }
 
+/**
+ * Usage without code signals is a separate observational population. Keep its
+ * retention boundary beside the figures so an empty or reduced list cannot be
+ * read as proof that no sessions existed.
+ */
+function usageCoverageCard(usage: ValuePayload['usage']): Node | null {
+  if (!usage) return null;
+  const retention = usage.retention;
+  return h('div', { class: 'card', style: 'margin-top: var(--s4)' },
+    h('div', { class: 'card-head' },
+      h('span', { class: 'card-title', text: () => (isPrecise() ? 'Usage without code signals' : 'Chat, research, and drafting') })),
+    h('div', { class: 'facts' },
+      h('div', { class: 'fact' },
+        h('span', { class: 'fact-key', text: () => (isPrecise() ? 'observed sessions' : 'sessions') }),
+        h('span', { class: 'fact-val', text: count(usage.units.length) })),
+      h('div', { class: 'fact' },
+        h('span', { class: 'fact-key', text: () => (isPrecise() ? 'reported realized' : 'realized') }),
+        h('span', { class: 'fact-val', text: count(usage.realizedUnits) })),
+      h('div', { class: 'fact' },
+        h('span', { class: 'fact-key', text: () => (isPrecise() ? 'surviving cost' : 'cost recorded') }),
+        h('span', { class: 'fact-val', text: usd(usage.totalCostUsd) }))),
+    retention.truncated
+      ? h('p', { class: 'drawer-error', role: 'status', text: () => (isPrecise()
+          ? `This usage window reaches behind retention: ${count(retention.rowsRemoved)} request row(s) were deleted before ${retention.prunedBeforeMs === null ? 'an unrecorded boundary' : new Date(retention.prunedBeforeMs).toISOString()}. Figures cover what survived, not everything metered.`
+          : 'Some requests in this usage window were deleted by retention, so these figures cover what remains rather than everything metered.') })
+      : null,
+    h('p', { class: 'basis', text: () => (isPrecise()
+      ? 'These sessions have no captured code proposals; reported outcomes remain observational and do not become coding value.'
+      : 'These sessions have no captured code proposals, so their reported outcomes stay separate from git-based value.') }));
+}
+
+/**
+ * Review-only model comparisons. Retention-excluded units are disclosed on the
+ * recommendation itself, while unknown coverage stays a qualified caveat rather
+ * than being treated as an intact window.
+ */
+function modelSwitchCoverageCard(frontier: ValuePayload['frontier']): Node | null {
+  const switches = frontier?.modelSwitches ?? [];
+  if (switches.length === 0) return null;
+  return h('section', { class: 'section' },
+    h('h2', { class: 'section-title', text: () => (isPrecise() ? 'Model-switch trials' : 'Cheaper model trials') }),
+    h('p', { class: 'view-plain', text: () => (isPrecise()
+      ? 'Historical comparisons are review-only. Fiscus never changes provider routing from them, and neither separation nor savings is causal evidence.'
+      : 'These are local historical comparisons to review, not automatic routing changes or proof that one model causes better outcomes.') }),
+    ...switches.slice(0, 4).map((recommendation) => {
+      const retentionExcluded = recommendation.unitsExcludedTruncatedSpend;
+      const retentionUnknown = recommendation.unitsUnknownSpendCoverage;
+      return h('div', { class: 'card' },
+        h('div', { class: 'card-head' },
+          h('span', { class: 'card-title', text: `${recommendation.candidateModel} before ${recommendation.incumbentModel}` }),
+          h('span', {
+            class: `pill ${recommendation.confidence === 'observational_separation' ? 'pill-ok' : 'pill-warn'}`,
+            text: recommendation.confidence === 'observational_separation' ? 'separated' : 'trial',
+          }),
+          // The derived assurance level beside the confidence word (D-240): what
+          // this comparison supports, stated where the number is.
+          h('span', {
+            class: `pill ${recommendation.assurance.advisory.meetsRequirement ? 'pill-ok' : 'pill-warn'}`,
+            text: `${recommendation.assurance.level} ${recommendation.assurance.label}`,
+          })),
+        h('p', { class: 'basis', role: 'status', text: () => (isPrecise()
+          ? `Decision assurance ${recommendation.assurance.level}: ${recommendation.assurance.advisory.meetsRequirement ? 'meets' : 'below'} the advisory requirement; the spend-change requirement (DAL-3, randomized) is not met by any observational comparison.`
+          : `${recommendation.assurance.advisory.meetsRequirement ? 'Strong enough to review as advice' : 'Not yet strong enough to act on as advice'}; never strong enough on its own to change which model you use.`) }),
+        h('p', { text: `${count(recommendation.candidateUnits)} vs ${count(recommendation.incumbentUnits)} mature ${recommendation.taskType} units · observed realization ${pct(recommendation.candidateRealizationRate, 0)} vs ${pct(recommendation.incumbentRealizationRate, 0)}` }),
+        retentionExcluded > 0
+          ? h('p', { class: 'drawer-error', role: 'status', text: () => (isPrecise()
+              ? `${count(retentionExcluded)} unit(s) excluded because retention deleted spend inside their attribution window; the comparison uses only surviving priced units.`
+              : `${count(retentionExcluded)} unit(s) were excluded because retention deleted spend in their attribution window, so the comparison uses the surviving priced units.`) })
+          : null,
+        retentionUnknown > 0
+          ? h('p', { class: 'basis', role: 'status', text: () => (isPrecise()
+              ? `${count(retentionUnknown)} included unit(s) predate the retention-coverage record, so whether their spend window lost rows is unknown.`
+              : `For ${count(retentionUnknown)} included unit(s), we cannot tell whether retention deleted spend because their snapshots predate the coverage record.`) })
+          : null,
+        h('p', { class: 'basis', text: () => (isPrecise()
+          ? `Observed headroom ${usd(recommendation.historicalEquivalentHeadroomUsd)}; this is a local list-price comparison, not provider-billed savings.`
+          : `Observed headroom ${usd(recommendation.historicalEquivalentHeadroomUsd)}; this is not a promise of future savings.`) }));
+    }));
+}
+
 export function valueView(): Node {
   const data = signal<ValuePayload | null>(null);
   const error = signal<string | null>(null);
@@ -142,7 +222,7 @@ export function valueView(): Node {
       if (!established) {
         return h('div', null,
           h('div', { class: 'notyet' },
-            h('h3', { text: () => (isPrecise() ? 'Realized value is not established' : 'We cannot tell you this yet') }),
+            h('h2', { text: () => (isPrecise() ? 'Realized value is not established' : 'We cannot tell you this yet') }),
             h('p', { text: () => (isPrecise()
               ? 'No work units have matured into verified outcomes on this machine. This is an absence of evidence, not a realized value of zero — the two must not be reported alike.'
               : 'Nothing has been observed all the way through to a shipped, surviving outcome yet. That is missing evidence, not an answer of nothing.') }),
@@ -150,16 +230,22 @@ export function valueView(): Node {
               ? 'Maturation requires observable outcomes: a repository whose history can be read, or imported units with recorded gate results.'
               : 'Fiscus needs somewhere to watch outcomes happen — usually a code repository — before it can say what the spend produced.') })),
           causalStudyCard(causal(), causalError()),
+          usageCoverageCard(d.usage),
           actions());
       }
 
       const funnel = matured?.instrumentation ?? {};
+      // Gates where two sources disagreed. Shown separately from the counts
+      // because a contradiction is not a measurement of the gate, and because
+      // the legacy projection renders it as a plain failure (AII-003).
+      const gateConflicts = Object.entries(matured?.gateConflicts ?? {}).filter(([, n]) => n > 0);
       const waste = (matured?.wasteByStage ?? []).filter((w) => w.stage !== 'realized');
       const wasteCost = waste.reduce((s, w) => s + w.costUsd, 0);
       const bounds = matured?.realizationBounds ?? null;
       const team = d.team ?? null;
       const drift = d.drift ?? null;
       const ret = d.roi?.returnRatio ?? null;
+      const economic = matured?.economic ?? null;
 
       return h('div', null,
         d.demo ? h('div', { class: 'banner banner-demo' },
@@ -194,13 +280,50 @@ export function valueView(): Node {
             ? h('span', { class: 'basis', text: () => (isPrecise()
                 ? `${count(d.realization?.costStaleUnits)} unit(s) carry stale cost attribution.`
                 : `${count(d.realization?.costStaleUnits)} of these have out-of-date cost information.`) })
+            : null,
+          // THE DENOMINATOR THE PARAGRAPH ABOVE IS ABOUT (D-176, D-178). A unit
+          // whose attribution window retention emptied contributes $0.00 and
+          // still counts, so the return above it is flattering by an unknown
+          // amount. `fiscus roi` has said this since D-176; until the fields
+          // were declared the browser could not read what the server was
+          // already sending.
+          (matured?.spendWindowTruncatedUnits ?? 0) > 0
+            ? h('span', { class: 'drawer-error', role: 'status', text: () => (isPrecise()
+                ? `${count(matured?.spendWindowTruncatedUnits)} unit(s) had spend deleted by retention inside their attribution window, so the cost denominator is understated and this return reads high.`
+                : `${count(matured?.spendWindowTruncatedUnits)} of these lost some of their cost records to your retention setting, so this looks like a better return than we can actually show.`) })
+            : null,
+          // Distinct from zero on purpose: a snapshot written before the
+          // coverage was recorded cannot say, and reading that as intact is the
+          // inference this pair of counts exists to refuse.
+          (matured?.spendWindowUnknownUnits ?? 0) > 0
+            ? h('span', { class: 'basis', text: () => (isPrecise()
+                ? `${count(matured?.spendWindowUnknownUnits)} unit(s) predate the retention-coverage record, so whether their spend window lost rows is unknown.`
+                : `For ${count(matured?.spendWindowUnknownUnits)} of these we cannot tell whether any cost records were deleted.`) })
             : null),
+          economic
+            ? h('p', { class: 'basis', role: 'status', text: () => {
+                if (economic.coverage === 'legacy_unknown' || economic.total === null) {
+                  return isPrecise()
+                    ? 'Exact economic coverage: legacy_unknown — these snapshots predate exact request evidence, so numeric costs are compatibility projections.'
+                    : 'Exact economic coverage is not available for these snapshots; the cost figures are legacy compatibility totals.';
+                }
+                const total = economic.total;
+                if (economic.coverage === 'partial' || total.unresolvedRequests > 0) {
+                  return isPrecise()
+                    ? `Exact economic coverage: partial — ${total.amountText} effective spend resolved across ${count(total.requestCount)} requests; ${count(total.unresolvedRequests)} unresolved legacy request(s) remain in the numeric compatibility total.`
+                    : `Some exact cost evidence is available (${total.amountText}), but ${count(total.unresolvedRequests)} request(s) lack it; the headline cost includes a compatibility projection.`;
+                }
+                return isPrecise()
+                  ? `Exact economic coverage: complete — ${total.amountText} effective spend across ${count(total.requestCount)} requests; source bases: ${total.sourceBases.join(', ') || 'none'}.`
+                  : `Cost evidence is complete for ${count(total.requestCount)} requests (${total.amountText} exact effective spend).`;
+              } })
+            : null,
 
         // The value claim and the cost figure, kept apart on purpose.
         //
-        // The payload spells two different quantities `realizedValueUsd`:
-        // `roi.returnRatio.realizedValueUsd` is manual-equivalent value produced,
-        // and `matured.realizedValueUsd` is the attributed SPEND on units that
+        // Two different quantities sit side by side:
+        // `roi.returnRatio.manualEquivalentValueUsd` is value produced, and
+        // `matured.spendOnRealizedUnitsUsd` is the attributed SPEND on units that
         // realized. An earlier version of this screen showed the second one under
         // the heading "what it produced", which reported a cost as a value --
         // the collapse this whole product is built to refuse. They now sit in
@@ -210,7 +333,7 @@ export function valueView(): Node {
               h('div', { class: 'card' },
                 h('div', { class: 'card-head' },
                   h('span', { class: 'card-title', text: () => (isPrecise() ? 'Realized value' : 'What the work was worth') })),
-                h('div', { class: 'stat', text: usd(ret.realizedValueUsd) }),
+                h('div', { class: 'stat', text: usd(ret.manualEquivalentValueUsd) }),
                 h('span', { class: 'basis', text: () => (isPrecise()
                   ? 'manual-equivalent dollars for realized work, net of rework'
                   : 'what that work would have cost to do by hand instead') })),
@@ -227,7 +350,7 @@ export function valueView(): Node {
                     ? 'the AI spend plus your own measured time, priced at your labour rate'
                     : 'the AI spend plus an estimate of the time it took you') })))
           : h('div', { class: 'notyet', style: 'margin-top: var(--s4)' },
-              h('h3', { text: () => (isPrecise() ? 'Realized value is not priced' : 'We cannot put a figure on this') }),
+              h('h2', { text: () => (isPrecise() ? 'Realized value is not priced' : 'We cannot put a figure on this') }),
               h('p', { text: () => (isPrecise()
                 ? 'Work matured, but no labour rate is configured, so the value it produced cannot be expressed in dollars. The rate below is still computable; the money figure is not.'
                 : 'Work did get finished, but Fiscus has no hourly rate to value it against — so it can tell you how much stuck, but not what it was worth.') })),
@@ -267,8 +390,14 @@ export function valueView(): Node {
                       ? `Drift alarm: the recent realization rate (${pct(drift.recentRate, 0)}) has departed from the overall rate (${pct(drift.overallRate, 0)}) beyond chance.`
                       : `Warning: work has recently been sticking much less often than it used to (${pct(drift.recentRate, 0)} against ${pct(drift.overallRate, 0)} overall).`)
                   : (isPrecise()
-                      ? `No drift detected over n=${count(drift.n)} mature units.`
-                      : 'The rate is holding steady — no sign it is drifting.')),              })
+                      ? `The drift alarm did not fire over n=${count(drift.n)} mature units.`
+                        + (drift.referenceDriftWouldFire === false
+                          ? ' At this length the same test does not fire even on a total regime change, so its silence carries no information.'
+                          : ' An e-process bounds false alarms and not missed ones, so this is not evidence that the rate held.')
+                      : `Nothing has tripped the drift watch over ${count(drift.n)} pieces of work`
+                        + (drift.referenceDriftWouldFire === false
+                          ? ', but that is too few for this check to notice a change at all yet.'
+                          : ' — which is not the same as knowing the rate held steady.'))),              })
             : null),
 
         // The actionable part: where units die and what that costs.
@@ -276,17 +405,22 @@ export function valueView(): Node {
           ? h('section', { class: 'section' },
               h('h2', { class: 'section-title', text: () => (isPrecise() ? 'Where value is lost' : 'Where the work fell over') }),
               h('p', { class: 'view-plain', text: () => (isPrecise()
-                ? `Of ${usd(matured?.totalCostUsd)} attributed to matured units, ${usd(matured?.realizedValueUsd)} reached a kept outcome and ${usd(wasteCost)} did not. These are spend figures, not value.`
-                : `Of the ${usd(matured?.totalCostUsd)} spent on this work, ${usd(matured?.realizedValueUsd)} went on work that stuck and ${usd(wasteCost)} went on work that did not.`) }),
-              h('div', { class: 'ledger' },
+                ? `Of ${usd(matured?.totalCostUsd)} attributed to matured units, ${usd(matured?.spendOnRealizedUnitsUsd)} reached a kept outcome and ${usd(wasteCost)} did not. These are spend figures, not value.`
+                : `Of the ${usd(matured?.totalCostUsd)} spent on this work, ${usd(matured?.spendOnRealizedUnitsUsd)} went on work that stuck and ${usd(wasteCost)} went on work that did not.`) }),
+              h('div', { class: 'ledger', role: 'table', 'aria-label': 'Where value was lost, by stopping stage' },
+                h('div', { class: 'ledger-head', role: 'row' },
+                  h('span', { role: 'columnheader', text: () => (isPrecise() ? 'Stopped at' : 'Where it stopped') }),
+                  h('span', { class: 'num cell-calls', role: 'columnheader', text: 'Units' }),
+                  h('span', { class: 'num cell-cost', role: 'columnheader', text: 'Cost' }),
+                  h('span', { class: 'num cell-share', role: 'columnheader', text: 'Share' })),
                 ...waste
                   .slice()
                   .sort((a, b) => b.costUsd - a.costUsd)
-                  .map((w) => h('div', { class: 'ledger-row' },
-                    h('span', { class: 'ledger-key', text: () => (isPrecise() ? w.stage : `stopped after ${STOPPED_AFTER[w.stage] ?? w.stage}`) }),
-                    h('span', { class: 'num cell-calls', text: `${count(w.units)} ${plural(w.units, 'unit', 'units')}` }),
-                    h('span', { class: 'num cell-cost ledger-cost', text: usd(w.costUsd) }),
-                    h('span', { class: 'num cell-share', text: wasteCost > 0 ? pct(w.costUsd / wasteCost, 0) : '—' }),
+                  .map((w) => h('div', { class: 'ledger-row', role: 'row' },
+                    h('span', { class: 'ledger-key', role: 'cell', text: () => (isPrecise() ? w.stage : `stopped after ${STOPPED_AFTER[w.stage] ?? w.stage}`) }),
+                    h('span', { class: 'num cell-calls', role: 'cell', text: `${count(w.units)} ${plural(w.units, 'unit', 'units')}` }),
+                    h('span', { class: 'num cell-cost ledger-cost', role: 'cell', text: usd(w.costUsd) }),
+                    h('span', { class: 'num cell-share', role: 'cell', text: wasteCost > 0 ? pct(w.costUsd / wasteCost, 0) : '—' }),
                     h('span', {
                       class: 'ledger-bar',
                       'aria-hidden': 'true',
@@ -302,7 +436,12 @@ export function valueView(): Node {
               h('div', { class: 'facts' },
                 ...Object.entries(funnel).map(([stage, n]) => h('div', { class: 'fact' },
                   h('span', { class: 'fact-key', text: () => (isPrecise() ? stage : (GATE_WORDS[stage] ?? stage)) }),
-                  h('span', { class: 'fact-val', text: count(n) })))))
+                  h('span', { class: 'fact-val', text: count(n) })))),
+              gateConflicts.length > 0
+                ? h('p', { class: 'section-note', text: () => (isPrecise()
+                    ? `Contradicted evidence at ${gateConflicts.map(([stage, n]) => `${stage} (${n})`).join(', ')}: sources both supported and refuted these gates. The unit records a failure only because the three-valued projection has no other option — it is unadjudicated, not refuted.`
+                    : `Some evidence disagrees with itself at ${gateConflicts.map(([stage]) => (GATE_WORDS[stage] ?? stage)).join(', ')}. That is a conflict to resolve, not a result.`) })
+                : null)
           : null,
 
         d.reclaimed && typeof d.reclaimed.workWeeksSaved === 'number'
@@ -336,6 +475,9 @@ export function valueView(): Node {
                     : `${count(d.reclaimed?.uncreditedUnits)} ${plural(d.reclaimed?.uncreditedUnits ?? 0, 'piece', 'pieces')} of work got no credit here — they either failed, or we had nothing to compare them against.`) })
                 : null)
           : null,
+
+        modelSwitchCoverageCard(d.frontier),
+        usageCoverageCard(d.usage),
 
         // Per-user. The guardrail state is the content when the cohort is suppressed.
         team

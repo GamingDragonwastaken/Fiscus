@@ -1,4 +1,17 @@
 /**
+ * ISSUANCE CLASS: kernel_primitive — see `src/epistemic/issuance-map.ts`.
+ * This is the observational-to-causal boundary, the single largest claim
+ * strengthening in the product, and it ISSUES NOTHING. It decides whether a
+ * local randomized study is structurally sound; `src/causal/epistemic.ts` turns
+ * a `qualified` result into kernel records, and mints the
+ * `causal_identification` witness ONLY from a qualification this file returned
+ * as qualified — so an unsound study cannot produce a legal derivation, and
+ * revoking the assignment evidence now revokes everything derived from it.
+ *
+ * It was `unmigrated_authority` until that adapter existed (AII-036, AII-021).
+ * The gates below were conservative and correct throughout; what was missing was
+ * that the conclusion was bound to nothing. Nothing here changed to close it.
+ *
  * Pure qualification gates for local randomized-study evidence.
  *
  * This module deliberately prefers an explicit collecting, inconclusive, or

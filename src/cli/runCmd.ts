@@ -192,8 +192,13 @@ export async function cmdPricing(flags: Flags): Promise<void> {
         for (const row of provenance.slice(0, 25)) {
           const match = row.rateMatchKind.replaceAll('_', ' ');
           const card = row.rateCardSha256?.slice(0, 12) ?? 'no-card';
+          const cardProvenance = row.rateCardProvenance;
+          const cardDetail = cardProvenance
+            ? cardProvenance.sourceKind + ' · accepted locally ' + cardProvenance.fetchedAt + (cardProvenance.sourceUrl ? ' · ' + cardProvenance.sourceUrl : '')
+            : 'card provenance unavailable';
           console.log(`  ${usd(row.costUsd).padStart(10)}  ${num(row.requests).padStart(5)} req  ${row.provider}/${row.model}`);
           console.log(`                 ${row.costBasis.replaceAll('_', ' ')} · ${match} · ${row.rateCardSourceKind} · ${card}`);
+          console.log('                 card provenance: ' + cardDetail);
         }
         if (provenance.length > 25) console.log(`  ${color(on, C.dim, `… ${provenance.length - 25} more evidence cohorts (use --json for the complete result)`)}`);
       }
@@ -356,8 +361,9 @@ export function cmdReprice(flags: Flags): void {
         stillEstimated++;
         continue; // still a guess — keep the original guess rather than churn numbers
       }
-      updates.push({ requestId: r.requestId, costUsd: c.costUsd, pricing: c.pricing });
-      const key = `${r.provider}/${r.model}`;
+      updates.push({ requestId: r.requestId, costUsd: c.costUsd, pricing: c.pricing, ...(c.exact === undefined ? {} : { economicAmount: c.exact.total }) });
+      // Tuple key, not a delimiter join (D-217/D-241): a model name may carry '/'.
+      const key = JSON.stringify([r.provider, r.model]);
       const agg = byModel.get(key) ?? { n: 0, before: 0, after: 0 };
       agg.n++;
       agg.before += r.costUsd;
@@ -382,7 +388,10 @@ export function cmdReprice(flags: Flags): void {
           sourceKind: updates[0]!.pricing.rateCardSourceKind,
           note: 'Local list-price estimate only; never provider invoice, discount, tax, credit, or reconciliation.',
         } : null,
-        byModel: [...byModel.entries()].map(([model, v]) => ({ model, rows: v.n, beforeUsd: v.before, afterUsd: v.after })),
+        byModel: [...byModel.entries()].map(([key, v]) => {
+          const [provider, model] = JSON.parse(key) as [string, string];
+          return { provider, model, rows: v.n, beforeUsd: v.before, afterUsd: v.after };
+        }),
         realizationSync: sync,
       });
       return;

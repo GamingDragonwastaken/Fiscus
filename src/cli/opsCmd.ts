@@ -9,7 +9,7 @@ import { loadConfig, saveConfig, dbPath, configPath, isDemo } from '../config.ts
 import { attributeCommits, isGitRepo } from '../git/correlate.ts';
 import { loadRealization } from '../value/realization.ts';
 import { buildGuide, type GuideFacts } from '../guide.ts';
-import { computeAlerts } from '../alerts/detect.ts';
+import { computeAlertCoverage, computeAlerts } from '../alerts/detect.ts';
 import { notifyWebhook } from '../alerts/notify.ts';
 import { pricingStatus } from '../cost/pricing.ts';
 import { baselineManifestStatus } from '../value/liftBaseline.ts';
@@ -42,11 +42,11 @@ export async function cmdAlerts(flags: Flags): Promise<void> {
   const store = new Store(dbPath());
 
   // Include realized-value alerts only when a git repo is available to measure them.
-  let realizedValueRate: number | null = null;
+  let realizedSpendShare: number | null = null;
   const repo = flags.repo as string | undefined;
   const loadedValue = await loadRealization(store, repo, { persist: false });
-  if (loadedValue) realizedValueRate = loadedValue.report.matured.realizedValueRate;
-  const alerts = computeAlerts(store, cfg, { realizedValueRate });
+  if (loadedValue) realizedSpendShare = loadedValue.report.matured.realizedSpendShare;
+  const alerts = computeAlerts(store, cfg, { realizedSpendShare });
 
   // Deliver to the configured webhook (cron-friendly), then exit.
   if (flags.notify) {
@@ -150,7 +150,22 @@ export async function cmdDoctor(): Promise<void> {
         : `${base.source === 'cache' ? 'refreshed' : 'bundled'}${baseAge} · ${base.taskTypeCount} task-types`
     }`,
   );
-  console.log(`  ${mark(criticals === 0)} Alerts      ${alerts.length ? `${num(alerts.length)} active (${criticals} critical) — see "fiscus alerts"` : color(tty, C.green, 'all clear')}`);
+  // NOT `all clear`. Caps are opt-in and a fresh ledger has no baseline, so on a
+  // default install not one of the six detectors can fire — and this line was
+  // printing a green tick over an empty array that recorded nothing being looked
+  // at. It now states coverage, which is what the evidence supports (D-141).
+  const coverage = computeAlertCoverage(store, cfg);
+  console.log(
+    `  ${mark(criticals === 0 && coverage.complete)} Alerts      ${
+      alerts.length
+        ? `${num(alerts.length)} active (${criticals} critical) — see "fiscus alerts"`
+        : color(tty, coverage.complete ? C.green : C.yellow, `no alerts · ${coverage.summary}`)
+    }`,
+  );
+  for (const channel of coverage.channels) {
+    if (channel.live) continue;
+    console.log(color(tty, C.gray, `              ${channel.channel}: ${channel.darkBecause}`));
+  }
   console.log('');
   console.log(color(tty, C.gray, '  Point your AI tools at the proxy:'));
   console.log(color(tty, C.gray, `    ANTHROPIC_BASE_URL=http://localhost:${cfg.port}   OPENAI_BASE_URL=http://localhost:${cfg.port}/v1`));
@@ -195,6 +210,9 @@ export async function gatherGuideFacts(): Promise<GuideFacts> {
   const sum30 = store.summary(now - 30 * day, now + 1000);
   const outcomeSignals = store.countSignals();
   const realizationUnits = store.countRealizationUnits();
+  // Read before the store closes: without it `requestsAllTime` is a count of
+  // survivors presented as a count of everything (D-170).
+  const requestsRetention = store.retentionFloor();
   store.close();
 
   const proxyStatus = await probeProxyState(cfg);
@@ -206,6 +224,7 @@ export async function gatherGuideFacts(): Promise<GuideFacts> {
     proxyUp: proxyStatus.kind === 'up',
     proxyStatus,
     requestsAllTime: all.requests,
+    requestsRetention,
     spend30dUsd: sum30.costUsd,
     dailyCapUsd: cfg.budget.dailyUsd,
     outcomeSignals,

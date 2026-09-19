@@ -9,6 +9,14 @@
 import { createHash, randomFillSync } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { estimateCausalStudy } from '../causal/estimate.ts';
+import {
+  openCausalInferenceLedger,
+  reportCausalStudyEstimate,
+  summarizeInferenceMultiplicity,
+  type CausalInferenceLedger,
+  type CausalStudyInferenceReport,
+  type RecordedInferentialAct,
+} from '../causal/inference-ledger.ts';
 import { CAUSAL_PROTOCOL_VERSION } from '../causal/types.ts';
 import {
   decodeCausalExecutionV2,
@@ -66,6 +74,34 @@ export interface CausalStudySummary {
   executions: number;
   outcomes: number;
   latestAnalysis: { analysisId: string; computedAtMs: number; state: string } | null;
+  /**
+   * Why `latestAnalysis` is what it is.
+   *
+   * A bare `null` reads as "no analysis has been saved". For every study this
+   * list can hold the truth is "no analysis CAN be saved": the list is
+   * version-1 only, and retained version-1 evidence is inspect-only. Those are
+   * different claims, and D-158 already separated them on the CLI's inspect
+   * surface -- this is the same separation on the row itself, so every consumer
+   * of a summary gets the reason beside the value rather than from a second
+   * mechanism.
+   */
+  analysisBasis: { available: boolean; reason: string };
+}
+
+/**
+ * The studies this list could not include, and why.
+ *
+ * `causalStudySummaries` drops version-2 protocols, deliberately -- their
+ * public projection is deferred and inventing one would be worse -- and until
+ * now it dropped them silently. With only version-2 studies registered the
+ * dashboard's prose said the projection was deferred; with one version-1 study
+ * beside them that sentence was replaced, the list showed one row, and the
+ * omitted studies were reported nowhere. A list that cannot say what it left
+ * out cannot be told from a list that left out nothing.
+ */
+export interface CausalStudyListBasis {
+  studies: CausalStudySummary[];
+  omitted: { count: number; reason: string };
 }
 
 class CausalLegacyInspectOnlyError extends Error {
@@ -74,6 +110,27 @@ class CausalLegacyInspectOnlyError extends Error {
   constructor(operation: string) {
     super('CAUSAL_LEGACY_INSPECT_ONLY: retained version-1 causal evidence is inspect-only; cannot ' + operation);
     this.name = 'CausalLegacyInspectOnlyError';
+  }
+}
+
+/**
+ * A registered version-2 study that this build has no analysis path for.
+ *
+ * NOT THE SAME ANSWER AS "not found", and the difference was costing the
+ * operator the wrong investigation. `saveCausalAnalysis` refuses version 1 as
+ * inspect-only and then asks `causalStudyData`, which returns null for anything
+ * that is not version 1 — so a registered, inspectable, summarised version-2
+ * study came back as `causal study was not found`. The study is there. The
+ * PROJECTION is deferred, and a refusal has to name the reason it refuses.
+ */
+class CausalV2AnalysisDeferredError extends Error {
+  readonly code = 'CAUSAL_V2_ANALYSIS_DEFERRED';
+
+  constructor(studyId: string) {
+    super('CAUSAL_V2_ANALYSIS_DEFERRED: causal study ' + studyId
+      + ' is registered at protocol version 2 and this build has no version-1 analysis path for it; '
+      + 'the study exists and the analysis projection is deferred');
+    this.name = 'CausalV2AnalysisDeferredError';
   }
 }
 
@@ -167,10 +224,9 @@ function hasExactCommittedProtocolV1Shape(value: unknown): value is CommittedCau
         || !hasExactKeys(value.economicOutcome.boundsUsd, ['low', 'high']))) {
     return false;
   }
-  return hasExactKeys(
-    value.analysis,
-    ['estimand', 'confidenceLevel', 'minCompletedPerArm', 'maxMissingFractionPerArm'],
-  );
+  const analysisKeys = ['estimand', 'confidenceLevel', 'minCompletedPerArm', 'maxMissingFractionPerArm'];
+  if (isRecord(value.analysis) && Object.hasOwn(value.analysis, 'jointInference')) analysisKeys.push('jointInference');
+  return hasExactKeys(value.analysis, analysisKeys);
 }
 
 const SQLITE_INT64_MIN = -9223372036854775808n;
@@ -1606,6 +1662,10 @@ export function saveCausalAnalysis(
   const protocol = loadProtocol(db, studyId);
   if (protocol) rejectLegacyMutation(protocol, 'save a version-1 analysis snapshot');
   const data = causalStudyData(db, studyId);
+  // Order matters: a registered study whose projection is deferred is a
+  // different answer from a study that is not there, and reporting the second
+  // for the first sends the operator looking for a missing row.
+  if (!data && protocol) throw new CausalV2AnalysisDeferredError(studyId);
   if (!data) throw new Error('causal study was not found');
   const estimate = estimateCausalStudy(data);
   const snapshot: CausalAnalysisSnapshot = { analysisId, computedAtMs, estimate };
@@ -1622,6 +1682,152 @@ export function saveCausalAnalysis(
   return snapshot;
 }
 
+/**
+ * Rebuild the study's inference ledger from the acts on disk.
+ *
+ * The genesis digest is recomputed by `openCausalInferenceLedger` from the
+ * study and protocol rather than stored, so a row that claims to belong to a
+ * different protocol cannot graft itself onto this chain. Nothing here VERIFIES
+ * the chain — that is `summarizeInferenceMultiplicity`'s job and it must stay
+ * there, because a loader that quietly dropped a bad row would turn a detected
+ * break into a smaller look count, which is the failure this whole mechanism
+ * exists to prevent.
+ *
+ * No plan is loaded because no surface registers one. That is not a gap being
+ * hidden: a plan must be declared before the first act or it is not a plan, so
+ * the honest basis today is `recorded_acts_only`, and the report says so.
+ */
+export function causalInferenceLedger(
+  db: DatabaseSync,
+  studyId: string,
+  protocolHash: string,
+): CausalInferenceLedger {
+  const empty = openCausalInferenceLedger({ studyId, protocolHash, plan: null });
+  const rows = db.prepare(
+    'SELECT act_json FROM causal_inference_acts WHERE study_id = ? ORDER BY sequence',
+  ).all(studyId) as Array<{ act_json: string }>;
+  if (rows.length === 0) return empty;
+  const acts = rows.map((row) => parseJson<RecordedInferentialAct>(row.act_json, 'inference act'));
+  return Object.freeze({
+    ...empty,
+    acts: Object.freeze(acts),
+    ledgerDigest: acts[acts.length - 1]!.actDigest,
+  });
+}
+
+/**
+ * Report the study, recording the look.
+ *
+ * WHY A READ PATH WRITES. Fiscus is read-only by default and `--apply`
+ * persists, and this does not breach that. An inferential act is not a change
+ * to the operator's data, to provider routing, or to budgets — it is an audit
+ * record of something that already happened, in the same category as an egress
+ * receipt, which is appended before the request it describes and whose failure
+ * stops the request. `reportCausalStudyEstimate` says in as many words that
+ * reporting IS the act. Declining to record it would not leave the count
+ * unchanged; it would leave it wrong, which is exactly the state every surface
+ * was in before this existed.
+ *
+ * The acts and the report are written under one transaction so a report can
+ * never be returned on the strength of a look that was not recorded.
+ *
+ * Returns null for a study with no version-1 analysis path, matching
+ * `causalStudyData`: a caller asking about a study this build cannot analyse
+ * has not made an error, and inventing an empty report for it would be the
+ * absence-as-result defect in a new place.
+ */
+export function reportCausalStudy(
+  db: DatabaseSync,
+  studyId: string,
+  reportedAtMs: number,
+): CausalStudyInferenceReport | null {
+  if (!Number.isInteger(reportedAtMs) || reportedAtMs <= 0) {
+    throw new Error('reportedAtMs must be a positive integer millisecond timestamp');
+  }
+  const data = causalStudyData(db, studyId);
+  if (data === null) return null;
+
+  const before = causalInferenceLedger(db, studyId, data.protocol.protocolHash);
+  const { ledger, report } = reportCausalStudyEstimate(before, data, { reportedAtMs });
+
+  // A BROKEN CHAIN IS NOT EXTENDED. If the stored acts no longer verify, the
+  // sequence a new act would take is already occupied or already wrong, and
+  // appending would produce a chain that verifies forward from a forged start
+  // -- a smaller look count wearing the appearance of an intact one. The report
+  // is still returned, and it already carries the right answer: the break
+  // propagates through `verifyActChain`, so `chainIntact` is false and the
+  // claim is withheld as `not_established` because the number of looks behind
+  // it is unknown. Withholding is the point; repairing would be the defect.
+  if (before.acts.length > 0 && !summarizeInferenceMultiplicity(before).chainIntact) return report;
+
+  const insert = db.prepare(
+    'INSERT INTO causal_inference_acts '
+    + '(study_id, sequence, protocol_hash, reported_at_ms, previous_act_digest, act_digest, act_json) '
+    + 'VALUES (?, ?, ?, ?, ?, ?, ?)',
+  );
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const act of ledger.acts.slice(before.acts.length)) {
+      insert.run(
+        act.studyId, act.sequence, act.protocolHash, act.reportedAtMs,
+        act.previousActDigest, act.actDigest, canonicalJson(act),
+      );
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+  return report;
+}
+
+/**
+ * The snapshot list, WITH the reason it is the length it is.
+ *
+ * An empty list reads as "no analysis has been saved". For every study this
+ * build can hold, the truth is "no analysis CAN be saved" — version-1 evidence
+ * is inspect-only and the version-2 analysis projection is deferred — and those
+ * are different claims. Returning the list alone made the second look like the
+ * first, which is the absence-as-result defect this repository exists to
+ * refuse.
+ *
+ * `available` is about writing a NEW snapshot, not about reading stored ones:
+ * a study can hold records and still not accept another.
+ */
+export interface CausalAnalysisSnapshotBasis {
+  readonly available: boolean;
+  readonly reason: string;
+  readonly records: CausalAnalysisSnapshot[];
+}
+
+export function causalAnalysisSnapshotBasis(
+  db: DatabaseSync,
+  studyId: string,
+): CausalAnalysisSnapshotBasis {
+  const records = causalAnalysisSnapshots(db, studyId);
+  const protocol = loadProtocol(db, studyId);
+  if (protocol === null) {
+    return Object.freeze({
+      available: false,
+      reason: 'causal study ' + studyId + ' is not registered in this local Store',
+      records,
+    });
+  }
+  if (protocol.version === 1) {
+    return Object.freeze({
+      available: false,
+      reason: 'retained version-1 causal evidence is inspect-only, so no new analysis snapshot can be written for this study',
+      records,
+    });
+  }
+  return Object.freeze({
+    available: false,
+    reason: 'version-2 analysis projection is deferred, so no analysis snapshot can be written for this study by this build; '
+      + 'an empty list here means none CAN be written, not that none has been',
+    records,
+  });
+}
+
 export function causalAnalysisSnapshots(db: DatabaseSync, studyId: string): CausalAnalysisSnapshot[] {
   return (db.prepare(
     'SELECT analysis_json FROM causal_analysis_snapshots WHERE study_id = ? ORDER BY computed_at_ms DESC, analysis_id DESC',
@@ -1629,6 +1835,10 @@ export function causalAnalysisSnapshots(db: DatabaseSync, studyId: string): Caus
 }
 
 export function causalStudySummaries(db: DatabaseSync): CausalStudySummary[] {
+  return causalStudyListBasis(db).studies;
+}
+
+export function causalStudyListBasis(db: DatabaseSync): CausalStudyListBasis {
   const rows = db.prepare(
     'SELECT p.study_id, p.protocol_hash, typeof(p.committed_at_ms) AS committed_at_ms_type, ' +
     'CAST(p.committed_at_ms AS TEXT) AS committed_at_ms_text, p.protocol_json, ' +
@@ -1661,9 +1871,15 @@ export function causalStudySummaries(db: DatabaseSync): CausalStudySummary[] {
     analysis_at_text: unknown;
     analysis_state: string | null;
   }>;
-  return rows.flatMap((row) => {
+  let omittedCount = 0;
+  const studies = rows.flatMap((row) => {
     const decoded = decodeStoredProtocolRow(row);
-    if (decoded.version === 2) return [];
+    // Counted, not included. The omission stands; what changes is that it is
+    // now reported rather than performed in silence.
+    if (decoded.version === 2) {
+      omittedCount += 1;
+      return [];
+    }
     const protocol = decoded.protocol;
     const analysisAtMs = decodeStoredAnalysisAtMs(row);
     return [{
@@ -1676,8 +1892,27 @@ export function causalStudySummaries(db: DatabaseSync): CausalStudySummary[] {
       latestAnalysis: row.analysis_id !== null && analysisAtMs !== null && row.analysis_state
         ? { analysisId: row.analysis_id, computedAtMs: analysisAtMs, state: row.analysis_state }
         : null,
+      // Every row here is a retained version-1 study by construction, so the
+      // reason is the version-1 one. It is stated per row rather than once per
+      // response because the reason is per study -- not registered, version-1
+      // inspect-only and version-2 deferred are three different sentences --
+      // and a figure carries its own basis.
+      analysisBasis: {
+        available: false,
+        reason: 'retained version-1 causal evidence is inspect-only, so no new analysis snapshot can be written for this study',
+      },
     }];
   });
+  return {
+    studies,
+    omitted: {
+      count: omittedCount,
+      reason: omittedCount === 0
+        ? 'no registered study was omitted from this list'
+        : 'version-2 public projection is deferred, so registered version-2 studies are not listed here; '
+          + 'this count is how many, not an assertion that they are absent',
+    },
+  };
 }
 
 // Version-2 assignment persistence is intentionally private to this module.

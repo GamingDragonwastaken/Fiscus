@@ -225,12 +225,16 @@ test('the two interfaces link to each other in both directions', () => {
 });
 
 /**
- * The payload spells two entirely different quantities `realizedValueUsd`:
+ * The payload carries two entirely different quantities side by side:
  *
- *   realization.matured.realizedValueUsd  the attributed SPEND on units that
+ *   realization.matured.spendOnRealizedUnitsUsd  the attributed SPEND on units that
  *                                         realized (sum of attributedCostUsd)
- *   roi.returnRatio.realizedValueUsd      the manual-equivalent VALUE those
+ *   roi.returnRatio.manualEquivalentValueUsd     the manual-equivalent VALUE those
  *                                         units produced, net of rework
+ *
+ * They were both spelled `realizedValueUsd` when the bug below happened, which
+ * is why nothing caught it. AII-012 gave them distinct identifiers, so the
+ * substitution is now a type error too — this grep is the second line.
  *
  * The spine shipped reading the first one into the fourth claim, so the band
  * labelled "Realized" — the value end of
@@ -264,9 +268,9 @@ test('the realized band carries the value claim, not the cost of realized work',
 
   // And it must not fall back to the cost field for that figure.
   assert.equal(
-    /valueUsd:\s*matured[?.]*\.realizedValueUsd/.test(claims),
+    /valueUsd:\s*matured[?.]*\.spendOnRealizedUnitsUsd/.test(claims),
     false,
-    'claimLayers.ts must not use matured.realizedValueUsd as the realized VALUE figure — that field is attributed spend',
+    'claimLayers.ts must not use matured.spendOnRealizedUnitsUsd as the realized VALUE figure — that field is attributed spend',
   );
 
   // A dollar figure is only shown when the payload says it priced one.
@@ -278,23 +282,34 @@ test('the realized band carries the value claim, not the cost of realized work',
 
   // The hazard is documented where the type is declared, so the next person to
   // write this interface from memory meets the warning first.
-  const api = readFileSync(join(WEB_SRC, 'app', 'core', 'api.ts'), 'utf8');
+  const api = readFileSync(join(import.meta.dirname, '..', 'src', 'dashboard', 'shared-types.ts'), 'utf8');
   assert.match(
     api,
-    /not the value they produced/,
-    'api.ts must warn that matured.realizedValueUsd is a cost, not a value',
+    /never the value it produced/,
+    'shared dashboard types must warn that matured.spendOnRealizedUnitsUsd is a cost, not a value',
+  );
+
+  // The stronger guarantee, added by AII-012: the two quantities no longer share
+  // an identifier, so substituting one for the other is a type error rather than
+  // something only a comment stands between you and.
+  assert.match(api, /spendOnRealizedUnitsUsd/, 'the cost field must be named as a cost');
+  assert.match(api, /manualEquivalentValueUsd/, 'the value field must be named as a value');
+  assert.doesNotMatch(
+    api,
+    /(?<![A-Za-z`])realizedValueUsd(?![A-Za-z`])/,
+    'the ambiguous identifier must not return to the shared payload types',
   );
 });
 
 /**
- * The GUI declares its own copy of BudgetConfig, and a wrong field name there is
+ * The browser consumes the generated shared BudgetConfig, and a wrong field name
  * SILENT in both directions: reading `budget.dailyCapUsd` off a payload that
  * spells it `dailyUsd` yields undefined, which the Control screen rendered as
  * "no cap set" while a cap was configured and enforcing; and posting the same
  * wrong key to /api/settings/update succeeds with a healthy-looking response,
  * because `applySettingsPatch` copies only the keys it recognises and ignores
  * the rest. No typecheck can catch it — the browser tsconfig cannot see the node
- * source, so the two interfaces are structurally unrelated.
+  * source, so the two interfaces used to be structurally unrelated.
  *
  * So the contract is pinned across the boundary: every field the server's
  * BudgetConfig declares must exist in the GUI's, spelled identically.
@@ -307,7 +322,7 @@ test('the GUI budget type matches the server budget config field for field', () 
 
   assert.ok(fields.length >= 5, `expected to parse the server BudgetConfig, got ${fields.length} fields`);
 
-  const gui = readFileSync(join(WEB_SRC, 'app', 'core', 'api.ts'), 'utf8');
+  const gui = readFileSync(join(import.meta.dirname, '..', 'src', 'dashboard', 'shared-types.ts'), 'utf8');
   const guiBlock = gui.slice(gui.indexOf('export interface BudgetConfig'));
   const guiBody = guiBlock.slice(0, guiBlock.indexOf(String.fromCharCode(10) + '}'));
 

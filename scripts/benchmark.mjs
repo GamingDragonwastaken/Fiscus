@@ -19,10 +19,30 @@ import { DEFAULT_CONFIG } from '../src/config.ts';
 import { computeFrontier } from '../src/value/frontier.ts';
 import { createDashboardServer } from '../src/dashboard/server.ts';
 import { buildOverview } from '../src/dashboard/routes.ts';
+import { claim } from '../src/epistemic/claim.ts';
+import { evidence } from '../src/epistemic/evidence.ts';
+import { claimProfile } from '../src/epistemic/profile.ts';
+import { grain } from '../src/epistemic/grain.ts';
+import { scope } from '../src/epistemic/scope.ts';
+import { interval } from '../src/epistemic/time.ts';
+import { exportLedgerPack } from '../src/pack/export.ts';
+import { serializeFiscusPack, verifyFiscusPack } from '../src/pack/index.ts';
+import { economicAttributionFromRows } from '../src/economics/attribution.ts';
+import { money } from '../src/economics/money.ts';
+import { applyAllocation } from '../src/alloc/apply.ts';
+import { checkInterfaceShape } from '../src/dashboard/contracts.ts';
+import { DASHBOARD_INTERFACE_CONTRACTS } from '../src/dashboard/web/app/core/generated-payload-contract.ts';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SCALE_ROWS = Object.freeze({ small: 100, current: 1_000, '10x': 10_000, '100x': 100_000 });
+const SCALE_PERSISTENT_PAIRS = Object.freeze({ small: 25, current: 50, '10x': 100, '100x': 200 });
 const DEFAULT_SCALES = ['small', 'current', '10x'];
+const EPISTEMIC_OCCURRED_AT = '2026-01-01T00:00:00.000Z';
+const EPISTEMIC_OBSERVED_AT = '2026-01-01T00:00:01.000Z';
+const EPISTEMIC_ISSUED_AT = '2026-01-01T00:00:02.000Z';
+const EPISTEMIC_PRE_OCCURRED_AS_OF = '2025-12-31T23:59:59.000Z';
+const EPISTEMIC_POST_ISSUED_AS_OF = '2026-01-01T00:00:03.000Z';
+const EPISTEMIC_VALID_TIME = interval('2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z');
 
 function parseArgs(argv) {
   const scalesArg = argv.find((arg) => arg.startsWith('--scale='));
@@ -96,6 +116,9 @@ function insertRows(store, count) {
       cacheReadTokens: i % 5 === 0 ? 20 : 0,
       reasoningTokens: 0,
       costUsd: 0.002 + (i % 17) / 10_000,
+      // The exact list-price amount the proxy path records beside the float, so
+      // the exact projection benchmark resolves every row (D-253).
+      economicAmount: money((0.002 + (i % 17) / 10_000).toFixed(6), 'USD', 'list'),
       estimated: false,
       streamed: i % 4 === 0,
       statusCode: i % 37 === 0 ? 429 : 200,
@@ -154,6 +177,353 @@ function syntheticUnits(count) {
   return units;
 }
 
+/**
+ * Exercise the canonical Evidence/Claim issuance boundary with a deterministic
+ * workload. This intentionally constructs records in memory rather than
+ * appending them to SQLite: the first H06 slice measures canonicalization and
+ * validation, while persistent graph replay is a separate future slice.
+ *
+ * The returned counts are quality checks, not timing metadata. Keeping them in
+ * the report prevents a benchmark from passing while its workload silently
+ * becomes empty or stops checking the Evidence -> Claim relationship.
+ */
+function benchmarkEpistemicIssuance(count) {
+  const benchmarkScope = scope({ account: 'benchmark' });
+  const benchmarkGrain = grain(['day', 'project']);
+  const benchmarkProfile = claimProfile({
+    epistemic: 'supported',
+    integrity: 'verified',
+    authenticity: 'provider_authenticated',
+    scope: 'established',
+    coverage: 'complete',
+    measurement: 'proxy_unvalidated',
+    causality: 'none',
+    monetaryBasis: 'billed',
+    finality: 'provisional',
+    decisionFitness: 'not_assessed',
+  });
+  let evidenceIssued = 0;
+  let claimsIssued = 0;
+  let claimsLinkedToEvidence = 0;
+  let immutableEvidence = 0;
+  let immutableClaims = 0;
+
+  for (let i = 0; i < count; i++) {
+    const item = evidence({
+      id: `benchmark:evidence:${i}`,
+      evidenceType: 'benchmark.observation',
+      sourceIdentity: 'benchmark:synthetic',
+      sourceClass: 'synthetic_fixture',
+      payload: { index: i, value: 'deterministic' },
+      scope: benchmarkScope,
+      grain: benchmarkGrain,
+      occurredAt: EPISTEMIC_OCCURRED_AT,
+      observedAt: EPISTEMIC_OBSERVED_AT,
+      integrity: 'verified',
+      authenticity: 'provider_authenticated',
+      completeness: { status: 'complete', method: 'deterministic_fixture' },
+      monetaryBasis: 'billed',
+      schemaVersion: 1,
+      sensitivity: 'internal',
+      redaction: 'none',
+    });
+    const assertion = claim({
+      id: `benchmark:claim:${i}`,
+      proposition: { predicate: 'benchmark.observed', value: { index: i, value: 'deterministic' } },
+      subject: `benchmark:project:${i % 8}`,
+      scope: benchmarkScope,
+      grain: benchmarkGrain,
+      time: { validTime: EPISTEMIC_VALID_TIME, asOf: EPISTEMIC_ISSUED_AT },
+      epistemic: 'supported',
+      profile: benchmarkProfile,
+      measurementModelRef: null,
+      evidenceIds: [item.id],
+      derivationRule: 'benchmark.issuance.v1',
+      derivationVersion: 1,
+      causalStatus: 'none',
+      issuedAt: EPISTEMIC_ISSUED_AT,
+      schemaVersion: 1,
+    });
+    evidenceIssued++;
+    claimsIssued++;
+    if (assertion.evidenceIds.includes(item.id)) claimsLinkedToEvidence++;
+    if (Object.isFrozen(item)) immutableEvidence++;
+    if (Object.isFrozen(assertion)) immutableClaims++;
+  }
+
+  let invalidClaimsRefused = 0;
+  try {
+    claim({
+      id: 'benchmark:claim:invalid',
+      proposition: { predicate: 'benchmark.invalid', value: null },
+      subject: 'benchmark:invalid',
+      scope: benchmarkScope,
+      grain: benchmarkGrain,
+      time: { validTime: EPISTEMIC_VALID_TIME, asOf: EPISTEMIC_ISSUED_AT },
+      epistemic: 'supported',
+      profile: benchmarkProfile,
+      measurementModelRef: null,
+      evidenceIds: [],
+      derivationRule: 'benchmark.issuance.v1',
+      derivationVersion: 1,
+      causalStatus: 'none',
+      issuedAt: EPISTEMIC_ISSUED_AT,
+      schemaVersion: 1,
+    });
+  } catch {
+    invalidClaimsRefused++;
+  }
+
+  if (count < 1 || evidenceIssued !== count || claimsIssued !== count || claimsLinkedToEvidence !== count
+      || immutableEvidence !== count || immutableClaims !== count || invalidClaimsRefused !== 1) {
+    throw new Error('epistemic benchmark quality checks failed');
+  }
+  return {
+    requestedRecords: count,
+    evidenceIssued,
+    claimsIssued,
+    claimsLinkedToEvidence,
+    immutableEvidence,
+    immutableClaims,
+    invalidClaimsRefused,
+  };
+}
+
+/**
+ * Exercise persistent SQLite storage and hindsight-safe graph replay for canonical
+ * Evidence and Claim records.
+ *
+ * Populates pairs of synthetic Evidence and dependent Claims in an atomic
+ * transaction on an isolated in-memory Store. Following transactional append,
+ * the workload queries `replayAsOf` at a boundary before acquisition (asserting
+ * 0 nodes) and after issuance (asserting all nodes and citation edges), and inspects
+ * `latestClaims` visible tips.
+ *
+ * Quality checks also verify that re-appending an identical record returns 'duplicate',
+ * a divergent payload with the same ID is refused, and a Claim citing a non-existent
+ * Evidence ID is refused.
+ */
+function benchmarkEpistemicPersistence(pairCount) {
+  const store = new Store(':memory:');
+  const ledger = store.epistemic();
+  const benchmarkScope = scope({ account: 'benchmark' });
+  const benchmarkGrain = grain(['day', 'project']);
+  const benchmarkProfile = claimProfile({
+    epistemic: 'supported',
+    integrity: 'verified',
+    authenticity: 'provider_authenticated',
+    scope: 'established',
+    coverage: 'complete',
+    measurement: 'proxy_unvalidated',
+    causality: 'none',
+    monetaryBasis: 'billed',
+    finality: 'provisional',
+    decisionFitness: 'not_assessed',
+  });
+
+  let evidenceAppended = 0;
+  let claimsAppended = 0;
+
+  ledger.runInTransaction(() => {
+    for (let i = 0; i < pairCount; i++) {
+      const item = evidence({
+        id: `benchmark:persistence:evidence:${i}`,
+        evidenceType: 'benchmark.observation',
+        sourceIdentity: 'benchmark:synthetic',
+        sourceClass: 'synthetic_fixture',
+        payload: { index: i, value: 'persistent' },
+        scope: benchmarkScope,
+        grain: benchmarkGrain,
+        occurredAt: EPISTEMIC_OCCURRED_AT,
+        observedAt: EPISTEMIC_OBSERVED_AT,
+        integrity: 'verified',
+        authenticity: 'provider_authenticated',
+        completeness: { status: 'complete', method: 'deterministic_fixture' },
+        monetaryBasis: 'billed',
+        schemaVersion: 1,
+        sensitivity: 'internal',
+        redaction: 'none',
+      });
+      const evidenceResult = ledger.appendEvidenceWithinTransaction(item);
+      if (evidenceResult === 'inserted') evidenceAppended++;
+
+      const assertion = claim({
+        id: `benchmark:persistence:claim:${i}`,
+        proposition: { predicate: 'benchmark.observed', value: { index: i, value: 'persistent' } },
+        subject: `benchmark:project:${i % 8}`,
+        scope: benchmarkScope,
+        grain: benchmarkGrain,
+        time: { validTime: EPISTEMIC_VALID_TIME, asOf: EPISTEMIC_ISSUED_AT },
+        epistemic: 'supported',
+        profile: benchmarkProfile,
+        measurementModelRef: null,
+        evidenceIds: [item.id],
+        derivationRule: 'benchmark.issuance.v1',
+        derivationVersion: 1,
+        causalStatus: 'none',
+        issuedAt: EPISTEMIC_ISSUED_AT,
+        schemaVersion: 1,
+      });
+      const claimResult = ledger.appendClaimWithinTransaction(assertion);
+      if (claimResult === 'inserted') claimsAppended++;
+    }
+  });
+
+  const historicalReplay = ledger.replayAsOf(EPISTEMIC_PRE_OCCURRED_AS_OF);
+  const activeReplay = ledger.replayAsOf(EPISTEMIC_POST_ISSUED_AS_OF);
+  const latest = ledger.latestClaims(EPISTEMIC_POST_ISSUED_AS_OF);
+
+  let idempotentDuplicatesIgnored = 0;
+  const firstEvidence = ledger.readEvidence('benchmark:persistence:evidence:0');
+  if (firstEvidence !== null) {
+    const dupResult = ledger.appendEvidence(firstEvidence);
+    if (dupResult === 'duplicate') idempotentDuplicatesIgnored++;
+  }
+
+  let divergentRefused = 0;
+  if (firstEvidence !== null) {
+    try {
+      ledger.appendEvidence(evidence({
+        ...firstEvidence,
+        payload: { index: 0, value: 'tampered-payload' },
+      }));
+    } catch {
+      divergentRefused++;
+    }
+  }
+
+  let missingDependencyRefused = 0;
+  try {
+    ledger.appendClaim(claim({
+      id: 'benchmark:persistence:claim:missing-ref',
+      proposition: { predicate: 'benchmark.observed', value: { index: -1 } },
+      subject: 'benchmark:project:0',
+      scope: benchmarkScope,
+      grain: benchmarkGrain,
+      time: { validTime: EPISTEMIC_VALID_TIME, asOf: EPISTEMIC_ISSUED_AT },
+      epistemic: 'supported',
+      profile: benchmarkProfile,
+      measurementModelRef: null,
+      evidenceIds: ['benchmark:persistence:evidence:missing'],
+      derivationRule: 'benchmark.issuance.v1',
+      derivationVersion: 1,
+      causalStatus: 'none',
+      issuedAt: EPISTEMIC_ISSUED_AT,
+      schemaVersion: 1,
+    }));
+  } catch {
+    missingDependencyRefused++;
+  }
+
+  const edgesStored = activeReplay.graph.edges.length;
+  const historicalNodes = historicalReplay.graph.nodes.length;
+  const activeNodes = activeReplay.graph.nodes.length;
+  const edgesReplayed = activeReplay.graph.edges.length;
+  const latestClaimsCount = latest.length;
+
+  store.close();
+
+  if (
+    pairCount < 1 ||
+    evidenceAppended !== pairCount ||
+    claimsAppended !== pairCount ||
+    edgesStored !== pairCount ||
+    historicalNodes !== 0 ||
+    activeNodes !== pairCount * 2 ||
+    edgesReplayed !== pairCount ||
+    latestClaimsCount !== pairCount ||
+    idempotentDuplicatesIgnored !== 1 ||
+    divergentRefused !== 1 ||
+    missingDependencyRefused !== 1
+  ) {
+    throw new Error('epistemic persistence benchmark quality checks failed');
+  }
+
+  return {
+    requestedPairs: pairCount,
+    evidenceAppended,
+    claimsAppended,
+    edgesStored,
+    historicalNodes,
+    activeNodes,
+    edgesReplayed,
+    latestClaims: latestClaimsCount,
+    idempotentDuplicatesIgnored,
+    divergentRefused,
+    missingDependencyRefused,
+  };
+}
+
+/**
+ * Revocation closure over a fan-out graph (D-238): one root evidence cited by
+ * every claim beside each claim's own record, so revoking the root must reach
+ * every claim while revoking one leaf reaches exactly one. The graph is built
+ * once; what is observed is the projection read, which is the operation a
+ * dashboard or as-of reader pays for.
+ */
+function buildRevocationLedger(pairCount) {
+  const store = new Store(':memory:');
+  const ledger = store.epistemic();
+  const benchmarkScope = scope({ account: 'benchmark' });
+  const benchmarkGrain = grain(['day', 'project']);
+  const benchmarkProfile = claimProfile({
+    epistemic: 'supported', integrity: 'verified', authenticity: 'provider_authenticated', scope: 'established',
+    coverage: 'complete', measurement: 'proxy_unvalidated', causality: 'none', monetaryBasis: 'billed',
+    finality: 'provisional', decisionFitness: 'not_assessed',
+  });
+  const record = (id, index) => evidence({
+    id, evidenceType: 'benchmark.observation', sourceIdentity: 'benchmark:synthetic', sourceClass: 'synthetic_fixture',
+    payload: { index }, scope: benchmarkScope, grain: benchmarkGrain, occurredAt: EPISTEMIC_OCCURRED_AT, observedAt: EPISTEMIC_OBSERVED_AT,
+    integrity: 'verified', authenticity: 'provider_authenticated', completeness: { status: 'complete', method: 'deterministic_fixture' },
+    monetaryBasis: 'billed', schemaVersion: 1, sensitivity: 'internal', redaction: 'none',
+  });
+  ledger.runInTransaction(() => {
+    ledger.appendEvidenceWithinTransaction(record('benchmark:revocation:root', -1));
+    for (let i = 0; i < pairCount; i++) {
+      ledger.appendEvidenceWithinTransaction(record(`benchmark:revocation:leaf:${i}`, i));
+      ledger.appendClaimWithinTransaction(claim({
+        id: `benchmark:revocation:claim:${i}`,
+        proposition: { predicate: 'benchmark.observed', value: { index: i } },
+        subject: `benchmark:project:${i % 8}`, scope: benchmarkScope, grain: benchmarkGrain,
+        time: { validTime: EPISTEMIC_VALID_TIME, asOf: EPISTEMIC_ISSUED_AT }, epistemic: 'supported', profile: benchmarkProfile,
+        measurementModelRef: null, evidenceIds: ['benchmark:revocation:root', `benchmark:revocation:leaf:${i}`],
+        derivationRule: 'benchmark.issuance.v1', derivationVersion: 1, causalStatus: 'none', issuedAt: EPISTEMIC_ISSUED_AT, schemaVersion: 1,
+      }));
+    }
+  });
+  ledger.appendRevocation({ eventId: 'benchmark:revoke:leaf:0', targetId: 'benchmark:revocation:leaf:0', recordedAt: EPISTEMIC_POST_ISSUED_AS_OF, reason: 'benchmark leaf withdrawal' });
+  ledger.appendRevocation({ eventId: 'benchmark:revoke:root', targetId: 'benchmark:revocation:root', recordedAt: EPISTEMIC_POST_ISSUED_AS_OF, reason: 'benchmark root withdrawal' });
+  return { store, ledger };
+}
+
+function revocationQuality(ledger, pairCount) {
+  const projection = ledger.revocationProjection();
+  const revoked = new Set(projection.revokedIds);
+  let claimsRevoked = 0;
+  for (let i = 0; i < pairCount; i++) if (revoked.has(`benchmark:revocation:claim:${i}`)) claimsRevoked++;
+  const nodesRevoked = revoked.size;
+  // root + leaf 0 + every claim; no other leaf is reached.
+  if (claimsRevoked !== pairCount || nodesRevoked !== pairCount + 2 || projection.pendingIds.length !== 0) {
+    throw new Error('revocation closure benchmark quality checks failed');
+  }
+  return { requestedPairs: pairCount, nodesRevoked, claimsRevoked, traceEntries: projection.trace.length };
+}
+
+/**
+ * `.fiscuspack` export and standalone-equivalent verification over the same
+ * ledger (D-238): the whole graph is packed, serialized and verified, and the
+ * verifier's own verdict is the quality check.
+ */
+function packRoundTrip(ledger) {
+  const { pack, summary } = exportLedgerPack({ ledger, packId: 'pack:benchmark', createdAt: EPISTEMIC_POST_ISSUED_AS_OF });
+  const encoded = serializeFiscusPack(pack);
+  const verdict = verifyFiscusPack(encoded);
+  if (!verdict.ok || verdict.integrity !== 'verified' || summary.omitted !== 0) {
+    throw new Error('fiscuspack round-trip benchmark quality checks failed');
+  }
+  return { included: summary.included, omitted: summary.omitted, redacted: summary.redacted, envelopeBytes: Buffer.byteLength(encoded, 'utf8') };
+}
+
 function directoryBytes(path) {
   try {
     let total = 0;
@@ -197,6 +567,37 @@ async function dashboardApiObservation(store) {
   }
 }
 
+// D-253: the exact effective-money projection over the ingested window, the
+// allocation run over the same rows under one direct rule per project, and the
+// deep interface walk the browser runs on every /api/overview response. Each
+// has a quality block computed from the same data, so a fast timing over an
+// empty projection, a non-conserving run or a skipped walk cannot pass.
+function exactProjection(store, startMs, endMs) {
+  const rows = store.economicRequestRowsInRange(startMs, endMs, { liveOnly: true });
+  const attribution = economicAttributionFromRows(rows);
+  return { rows: rows.length, requestCount: attribution.requestCount, unresolvedRequests: attribution.unresolvedRequests, complete: attribution.complete, amountText: attribution.amountText };
+}
+
+function allocationRun(store, startMs, endMs, runAtMs) {
+  const rows = store.requestsInRange(startMs, endMs).map((row) => ({
+    project: row.project, provider: row.provider, model: row.model, source: row.source ?? null, user: row.user ?? null,
+    tsEpochMs: row.tsEpochMs, costUsd: row.costUsd, costBasis: row.pricing.costBasis,
+  }));
+  const projects = [...new Set(rows.map((row) => row.project))].sort();
+  const costCentres = projects.map((project) => ({ costCentreId: `cc:${project}`, name: project, owner: null, createdAtMs: 0, archivedAtMs: null }));
+  const rules = projects.map((project, i) => ({
+    ruleId: `rule:${project}`, version: 1, method: 'direct', match: { project }, targets: [{ costCentreId: `cc:${project}`, ratio: 1 }],
+    priority: 100 + i, effectiveFromMs: 0, effectiveToMs: null, revokedAtMs: null, owner: null, note: null, createdAtMs: 0,
+  }));
+  const result = applyAllocation({ rows, rules, costCentres, periodStartMs: startMs, periodEndMs: endMs, runAtMs, requestsPrunedBeforeMs: null });
+  return { rows: rows.length, costCentres: costCentres.length, lines: result.lines.length, totalMicros: result.totalMicros, allocatedMicros: result.allocatedMicros, unallocatedMicros: result.unallocatedMicros, conserves: result.conserves };
+}
+
+function contractWalk(payload) {
+  const problems = checkInterfaceShape('Overview', payload, DASHBOARD_INTERFACE_CONTRACTS, 'Overview');
+  return { typeName: 'Overview', fields: Object.keys(payload).length, problems: problems.length, firstProblem: problems[0] ?? null };
+}
+
 async function runCase(name, rows, iterations) {
   const startup = observe(() => {
     const store = new Store(':memory:');
@@ -212,6 +613,16 @@ async function runCase(name, rows, iterations) {
   const startMs = 0;
   const endMs = Date.now() + 1000;
   const units = syntheticUnits(Math.max(24, Math.min(rows, 100_000)));
+  const persistentPairs = SCALE_PERSISTENT_PAIRS[name] ?? 25;
+  const epistemicQuality = benchmarkEpistemicIssuance(rows);
+  const persistenceQuality = benchmarkEpistemicPersistence(persistentPairs);
+  const revocation = buildRevocationLedger(persistentPairs);
+  const revocationQualityReport = revocationQuality(revocation.ledger, persistentPairs);
+  const packQuality = packRoundTrip(revocation.ledger);
+  const projectionQuality = exactProjection(ingestStore, startMs, endMs);
+  const allocationQuality = allocationRun(ingestStore, startMs, endMs, endMs + 1);
+  const overviewPayload = buildOverview(ingestStore, DEFAULT_CONFIG, 'all');
+  const contractQuality = contractWalk(overviewPayload);
   const observations = {
     startup,
     ingest: { samples: 1, minMs: ingestMs, medianMs: ingestMs, p95Ms: ingestMs, maxMs: ingestMs },
@@ -220,15 +631,32 @@ async function runCase(name, rows, iterations) {
     byModel: observe(() => ingestStore.byModel(startMs, endMs), iterations),
     overviewAssembly: observe(() => buildOverview(ingestStore, DEFAULT_CONFIG, 'all'), iterations),
     frontier: observe(() => computeFrontier(units), iterations),
+    epistemicIssuance: observe(() => benchmarkEpistemicIssuance(rows), iterations),
+    epistemicPersistence: observe(() => benchmarkEpistemicPersistence(persistentPairs), iterations),
+    revocationClosure: observe(() => revocation.ledger.revocationProjection(), iterations),
+    fiscuspackRoundTrip: observe(() => packRoundTrip(revocation.ledger), iterations),
     apiOverviewHttp: await dashboardApiObservation(ingestStore),
+    exactProjection: observe(() => exactProjection(ingestStore, startMs, endMs), iterations),
+    allocationRun: observe(() => allocationRun(ingestStore, startMs, endMs, endMs + 1), iterations),
+    dashboardContractWalk: observe(() => contractWalk(overviewPayload), iterations),
   };
   ingestStore.close();
+  revocation.store.close();
   return {
     scale: name,
     rows,
     frontierUnits: units.length,
     rssDeltaBytes: Math.max(0, rssAfter - rssBefore),
     observations,
+    quality: {
+      epistemicIssuance: epistemicQuality,
+      epistemicPersistence: persistenceQuality,
+      revocationClosure: revocationQualityReport,
+      fiscuspackRoundTrip: packQuality,
+      exactProjection: projectionQuality,
+      allocationRun: allocationQuality,
+      dashboardContractWalk: contractQuality,
+    },
   };
 }
 

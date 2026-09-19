@@ -67,6 +67,12 @@ npm install        # compiles the local CLI; Fiscus has zero runtime dependencie
 npm run demo       # rebuilds, seeds labelled synthetic data, and starts the local dashboard
 ```
 
+"Zero runtime dependencies" is checked, not asserted: `npm run sbom` emits a
+CycloneDX bill of materials for the runtime tree from npm's own generator, and
+`npm run verify:sbom` (run by CI on every package build, SBOM uploaded as an
+artifact) fails if that tree contains any component but Fiscus itself. The SBOM
+is unsigned; signed build provenance is not published.
+
 That lights up spend, governance alerts, the RoI index and its four value
 lenses, the model-by-task frontier, budget controls, and a review-only synthetic
 model trial in an isolated `demo.db`. Clear it with `fiscus demo --clear`.
@@ -221,7 +227,7 @@ fiscus exec -- <command>     AMBIENT outcome capture — wrap a command once (e.
                                 `npm test`); every run reports its own exit code
 fiscus receipt --repo <path> Emit signed value receipts (--pubkey to publish your
                                 identity; --verify <file> --key-id <id> to verify + pin)
-fiscus yield --repo <path>   AI Yield (survival lens) — durable lines per $
+fiscus yield --repo <path>   Artifact persistence (legacy yield lens) — retained introduced lines per $
 fiscus budget ...            Set caps (see below)
 fiscus audit --repo <path>   Cost per commit from git history (--limit N, --json)
 ```
@@ -252,6 +258,17 @@ fiscus project               Spend by project with aliases applied (--json). Too
                                 or never attributed at all
 fiscus prune                 Prune old rows and compact the DB
 fiscus backup --out <file>  Create a verified local SQLite ledger snapshot
+fiscus pack export --out <file>
+                                Write the epistemic ledger as a .fiscuspack: every
+                                record bound by digest, omissions and redactions
+                                stated ([--sign <private-key.pem>]); pack verify
+                                <file> [--trust <key>] and pack inspect <file>
+                                check the bytes and read the manifest — truth is
+                                never evaluated
+fiscus plugin run --manifest <file> --request <file> --exec <path> --scope k=v
+                                One bounded exchange with a plugin process; preview
+                                the kernel Evidence it would append (self-asserted,
+                                completeness unknown), --apply to append it
 fiscus restore --from <file> --out <file>
                                 Preview a snapshot, or create a new verified
                                 database with --apply (never overwrites the active ledger)
@@ -446,10 +463,12 @@ fiscus receipt --repo .            # emit signed value receipts
 ```
 
 The full model is in **[docs/THE-STANDARD.md](docs/THE-STANDARD.md)**. The older
-**AI Yield** (`fiscus yield`) survives as one *lens* — durable lines per
-dollar — but the Standard, not Yield, is the headline. The honest account of why
-the research's "AI Efficiency Score" and our own first Yield-only attempt were
-both rebuilt is in [docs/RESEARCH-REVIEW.md §3](docs/RESEARCH-REVIEW.md).
+**AI Yield** (`fiscus yield`) remains as a compatibility command for one
+*artifact-persistence lens* — retained introduced lines per dollar. It is not a
+quality grade and does not establish correctness, maintainability, business
+value, or AI/human contribution. The Standard, not this lens, is the headline.
+The historical account of why the research's "AI Efficiency Score" and our own
+first Yield-only attempt were rebuilt is in [docs/RESEARCH-REVIEW.md §3](docs/RESEARCH-REVIEW.md).
 
 ## Budget controls and model trials
 
@@ -489,10 +508,12 @@ product surfaces because model/task and project cells can be unlike work. -->
   attribution window it worked in: a unit whose window is more than 20% other
   models cannot price a single model, so it is excluded — and the excluded count
   is reported alongside the result rather than quietly shrinking the sample.
-  A result is labelled **evidence-supported** only when the anytime-valid outcome
-  bounds separate *and* that separation survives one outcome flipping the wrong
-  way on each side; anything resting on a single observation stays a **trial**,
-  not a proven switch. It never changes routing.
+  A result is labelled **observational separation** only when the anytime-valid
+  outcome bounds separate *and* that separation survives one outcome flipping the
+  wrong way on each side; anything resting on a single observation stays a
+  **trial**, not a proven switch. Neither label is causal evidence — models are
+  not assigned, so a separation describes the observed comparison, not the
+  models. It never changes routing.
 - **It says when a comparison is confounded.** Cost-per-unit is blind to how big
   each unit was, so if the two models' median changed lines differ by more than
   2×, "cheaper" may just mean "smaller work" — that is named on the result and
@@ -896,3 +917,15 @@ it is not approved for an internet-facing production deployment. See
 and do not prove.
 
 MIT licensed.
+
+## For contributors and reviewers
+
+[CONTRIBUTING.md](CONTRIBUTING.md) is how work is verified here; [GOVERNANCE.md](GOVERNANCE.md)
+says who decides what and where decisions are recorded; [SECURITY.md](SECURITY.md)
+is the reporting policy. The trust boundaries and what the append-only ledger and
+signatures do and do not guarantee are in [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md);
+what stays stable across releases is in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md);
+how a release is gated is in [docs/RELEASE-PROCESS.md](docs/RELEASE-PROCESS.md);
+support expectations are in [docs/SUPPORT.md](docs/SUPPORT.md); and
+[docs/NEUTRALITY.md](docs/NEUTRALITY.md) states that the core needs no hosted
+service, account, subscription or donation to be useful.

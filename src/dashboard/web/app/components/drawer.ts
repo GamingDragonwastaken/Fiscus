@@ -212,11 +212,39 @@ function panel(spec: ActionSpec): Node {
     h(
       'footer',
       { class: 'drawer-foot' },
-      () => {
-        const r = result();
-        if (r) return h('p', { class: r.ok ? 'drawer-done' : 'drawer-error', text: r.message });
-        return null;
+
+      // The outcome region is mounted with the drawer, not with the outcome.
+      //
+      // Committing sets `result`, and that same signal disables the commit
+      // button — `result() === null` is part of `ready` — so at the exact
+      // moment the only report of what happened appeared, the operator's focus
+      // was dropped from a control that had just become disabled. The report
+      // was a bare `<p>`: nothing announced it, and a live region built in the
+      // same tick as its first message is not reliably spoken either, which is
+      // why the region has to exist before there is anything to say.
+      //
+      // The negative margin is layout compensation, not styling: `.drawer-foot`
+      // is a flex column with a gap, so a permanently present child introduces
+      // one gap the old on-demand paragraph never did. The message re-adds it.
+      // Spacing is therefore identical to before in both states.
+      h('div', {
+        class: 'drawer-result',
+        role: 'status',
+        'aria-live': 'polite',
+        'aria-atomic': 'true',
+        style: 'margin-bottom: calc(var(--s3) * -1)',
       },
+        () => {
+          const r = result();
+          if (r) {
+            return h('p', {
+              class: r.ok ? 'drawer-done' : 'drawer-error',
+              style: 'margin-bottom: var(--s3)',
+              text: r.message,
+            });
+          }
+          return null;
+        }),
       h('div', { class: 'drawer-actions' },
         h('button', { class: 'btn-ghost', text: 'Close', onclick: () => closeAction() }),
         spec.download
@@ -226,20 +254,33 @@ function panel(spec: ActionSpec): Node {
           if (!spec.commit) return null;
           const p = preview();
           const ready = !busy() && p !== null && p.applicable && confirmed() && !committing() && result() === null;
-          return h('button', {
-            class: `btn-commit tone-${consequence.tone}`,
-            disabled: !ready,
-            title: p && !p.applicable ? (p.blockedReason ?? 'Nothing to apply') : undefined,
-            text: () => (committing() ? 'Working…' : commitLabel(cap.consequence)),
-            onclick: () => {
-              if (!ready || !spec.commit) return;
-              committing.set(true);
-              void spec.commit()
-                .then((r) => result.set(r))
-                .catch((e: unknown) => result.set({ ok: false, message: e instanceof Error ? e.message : String(e) }))
-                .finally(() => committing.set(false));
-            },
-          });
+          // `title` is not exposed to keyboard or screen-reader users on a
+          // `disabled` control — browsers do not run hover/focus tooltip
+          // logic for it, and a disabled element cannot receive focus at
+          // all — so it was the ONLY carrier of why the button could not be
+          // pressed. The reason is now a visible sibling, reached from the
+          // button with `aria-describedby`, the same pattern the daily-cap
+          // field uses for its own consequence text (`actions.ts`).
+          const blocked = p && !p.applicable ? (p.blockedReason ?? 'Nothing to apply') : null;
+          return [
+            blocked
+              ? h('p', { id: 'drawer-blocked-reason', class: 'drawer-note', text: blocked })
+              : null,
+            h('button', {
+              class: `btn-commit tone-${consequence.tone}`,
+              disabled: !ready,
+              'aria-describedby': blocked ? 'drawer-blocked-reason' : undefined,
+              text: () => (committing() ? 'Working…' : commitLabel(cap.consequence)),
+              onclick: () => {
+                if (!ready || !spec.commit) return;
+                committing.set(true);
+                void spec.commit()
+                  .then((r) => result.set(r))
+                  .catch((e: unknown) => result.set({ ok: false, message: e instanceof Error ? e.message : String(e) }))
+                  .finally(() => committing.set(false));
+              },
+            }),
+          ];
         },
       ),
     ),

@@ -28,6 +28,83 @@ adds a real loopback HTTP request and response read. `frontier` exercises the
 same local model/value comparison engine used by the advisor. RSS is a process
 delta, so it is an observation rather than a leak verdict.
 
+## Epistemic issuance quality boundary
+
+The `epistemicIssuance` operation exercises canonical Evidence and Claim
+construction at every selected scale. It uses fixed timestamps, scope, grain,
+and profile inputs so the workload is reproducible; it does not read provider
+data, call a judge, or append to SQLite. Each case also publishes a quality
+record with the requested count, Evidence and Claim counts, Evidence-to-Claim
+link count, immutable-record count, and one deliberately invalid Claim refusal.
+The benchmark contract test requires these counts to be non-zero and equal to
+the requested workload, so a timing report cannot remain green after its truth
+workload becomes empty or loses the dependency it claims to exercise.
+
+This is the first H06 truth-boundary slice: canonical construction and
+validation are measured, while persistent ledger append, graph replay/as-of,
+revocation closure and `.fiscuspack` verification are measured by the two
+sections below. Exact projections, allocation, dashboard contract validation
+and proxy streaming are not benchmarked; those are the four surfaces still
+outside the harness, stated here so the list cannot pass for coverage. The
+quality counts are correctness probes, not latency thresholds or release
+budgets.
+
+## Epistemic persistence and graph replay boundary
+
+The `epistemicPersistence` operation exercises persistent SQLite storage and
+hindsight-safe graph replay for canonical Evidence and Claims across the scale
+ladder (`small: 25`, `current: 50`, `10x: 100`, `100x: 200` pairs). It operates
+on an isolated in-memory Store handle without network egress or provider
+credentials.
+
+Each pair populates one synthetic Evidence record and one Claim citing that
+Evidence inside an atomic SQLite transaction, creating stored DAG nodes and
+citation edges. The workload then performs deterministic query and refusal checks:
+1. `replayAsOf` at a boundary preceding acquisition verifies 0 historical nodes.
+2. `replayAsOf` at a boundary following issuance reconstructs all persisted nodes and edges.
+3. `latestClaims` verifies that all visible tip claims are accessible.
+4. Idempotency check verifies that re-appending an identical record returns `'duplicate'`.
+5. Integrity check verifies that re-appending a divergent record for an existing identity is refused.
+6. Dependency check verifies that a Claim citing a missing Evidence ID is refused.
+
+Every synthetic fixture explicitly declares `sourceIdentity: 'benchmark:synthetic'`,
+`sourceClass: 'synthetic_fixture'`, and `completeness.method: 'deterministic_fixture'`,
+preventing synthetic benchmark records from resembling production evidence. Sizing is
+bounded across the scale ladder to maintain sub-second to low-second determinism under
+full SQLite schema, digest, and DAG validation invariants. The published counts are
+contract-tested quality gates, not latency budgets.
+
+## Revocation closure and `.fiscuspack` round-trip boundary
+
+The `revocationClosure` and `fiscuspackRoundTrip` operations (D-238) share
+one ledger per scale: a fan-out graph of one shared root Evidence cited by
+every Claim beside that Claim's own leaf Evidence (`small: 25` pairs, up to
+`100x: 200`). Two revocations are recorded — one leaf and the shared root —
+and the graph is built once so that what is timed is the READ:
+`revocationProjection()` for closure, and `exportLedgerPack` →
+`serializeFiscusPack` → `verifyFiscusPack` for the pack. The quality block
+requires the root's closure to reach every Claim and exactly one other leaf
+(`nodesRevoked = pairs + 2`), no pending entries, the whole graph packed with
+nothing omitted, and the verifier's own verdict `ok` with `integrity:
+verified`. A timing over an empty or half-built graph therefore cannot pass
+the contract test.
+
+## Exact projection, allocation run and contract-walk boundary
+
+`exactProjection`, `allocationRun` and `dashboardContractWalk` (D-253) run
+over the same ingested window as the summary operations. Every benchmark row
+now carries the exact list-price `economicAmount` the proxy path records
+beside the float, so the projection resolves every row (`complete: true`,
+`unresolvedRequests: 0`, `amountText` the exact sum) rather than timing an
+unresolved join. The allocation run applies one direct rule per synthetic
+project and must conserve to the microdollar with nothing unallocated. The
+contract walk is the same `checkInterfaceShape` the browser runs on every
+`/api/overview` response, against the generated field table, and must find
+no problems. Proxy streaming is not benchmarked here: it needs an upstream,
+and this harness attempts no network by contract. No latency budget is
+asserted for any operation — that is a policy the release owner sets from
+repeated runs on the release machine, not a number this file can supply.
+
 ## 2026-08-28 Windows baseline
 
 Environment: Node `v24.18.0`, `win32/x64`, with the source revision recorded in

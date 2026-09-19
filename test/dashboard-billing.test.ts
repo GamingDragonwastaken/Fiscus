@@ -69,6 +69,7 @@ test('GET /api/billing: empty evidence remains explicitly separate and unresolve
         status: { latestRun: unknown };
         coverage: unknown;
       };
+      kernel: { kind: string; claims: unknown[]; observedClaims: unknown[]; reconciliationClaims: unknown[] };
     };
     assert.equal(body.evidence.kind, 'provider_billing_evidence');
     assert.equal(body.evidence.trust, 'operator_supplied_unverified');
@@ -81,6 +82,10 @@ test('GET /api/billing: empty evidence remains explicitly separate and unresolve
     assert.equal(body.summary.recordCount, 0);
     assert.equal(body.summary.reconciliationStatus, 'not_reconciled');
     assert.deepEqual(body.imports, []);
+    assert.equal(body.kernel.kind, 'trusted_epistemic_kernel_billing');
+    assert.deepEqual(body.kernel.claims, []);
+    assert.deepEqual(body.kernel.observedClaims, []);
+    assert.deepEqual(body.kernel.reconciliationClaims, []);
     assert.equal(body.mapping.coverageStatus, 'no_records');
     assert.equal(body.mapping.reconciliationStatus, 'blocked_no_records');
     assert.equal(body.mapping.totalRecordCount, 0);
@@ -107,7 +112,7 @@ test('GET /api/billing exposes direct OpenAI observation status and local covera
     declaredAtMs: 1,
     activatedAtMs: 1,
   });
-  store.recordOpenAiCostsObservation({
+  const observationRun = store.recordOpenAiCostsObservation({
     declaredScopeId: scope.declarationId,
     providerProjectRef: 'proj_billing_fixture',
     periodStartMs: start,
@@ -127,6 +132,7 @@ test('GET /api/billing exposes direct OpenAI observation status and local covera
       amountDecimal: '7.50',
     }],
   });
+  store.issueOpenAiCostsObservationToKernel(observationRun.observationRunId);
   store.insertRequest({
     ...meteredRequest(),
     requestId: 'direct-coverage-request',
@@ -143,6 +149,7 @@ test('GET /api/billing exposes direct OpenAI observation status and local covera
         status: { latestRun: { resultState: string; observationsStored: number } };
         coverage: { comparisonStatus: string; varianceStatus: string; capturedOnDeclaredRoute: { requestCount: number; costUsd: number }; observation: Record<string, unknown> };
       };
+      kernel: { observedClaims: Array<{ proposition: { predicate: string }; profile: { monetaryBasis: string; authenticity: string }; evidenceIds: string[] }> };
     };
     assert.equal(body.directOpenAiCosts.status.latestRun.resultState, 'succeeded');
     assert.equal(body.directOpenAiCosts.status.latestRun.observationsStored, 1);
@@ -151,6 +158,11 @@ test('GET /api/billing exposes direct OpenAI observation status and local covera
     assert.equal(body.directOpenAiCosts.coverage.capturedOnDeclaredRoute.requestCount, 1);
     assert.equal(body.directOpenAiCosts.coverage.capturedOnDeclaredRoute.costUsd, 2.5);
     assert.equal('providerAmount' in body.directOpenAiCosts.coverage.observation, false);
+    assert.equal(body.kernel.observedClaims.length, 1);
+    assert.equal(body.kernel.observedClaims[0]!.proposition.predicate, 'billing.provider_observed_period_total');
+    assert.equal(body.kernel.observedClaims[0]!.profile.monetaryBasis, 'provider_observed');
+    assert.equal(body.kernel.observedClaims[0]!.profile.authenticity, 'provider_authenticated');
+    assert.equal(body.kernel.observedClaims[0]!.evidenceIds.length, 1);
 
     const overview = await fetch(`${srv.base}/api/overview?range=all`);
     const overviewBody = await overview.json() as { summary: { costUsd: number; requests: number } };
@@ -166,7 +178,8 @@ test('GET /api/billing: imported evidence has provenance but never changes overv
   const store = new Store(':memory:');
   store.insertRequest(meteredRequest());
   const imported = readBillingImportFile(FIXTURE).input;
-  store.applyBillingImport(imported, 1_777);
+  const importedRun = store.applyBillingImport(imported, 1_777);
+  store.issueBillingImportToKernel(importedRun.run.importId);
   const srv = await boot(store);
   try {
     const billing = await fetch(`${srv.base}/api/billing`);
@@ -182,6 +195,7 @@ test('GET /api/billing: imported evidence has provenance but never changes overv
         residualMicros: number;
         excludedFrom: string[];
       };
+      kernel: { kind: string; claims: Array<{ proposition: { predicate: string }; profile: { monetaryBasis: string; authenticity: string }; evidenceIds: string[] }> };
     };
     assert.deepEqual(body.summary, {
       importCount: 1,
@@ -201,6 +215,12 @@ test('GET /api/billing: imported evidence has provenance but never changes overv
     assert.equal(body.mapping.mappedRecordCount, 0);
     assert.equal(body.mapping.residualMicros, 11_345_678);
     assert.deepEqual(body.mapping.excludedFrom, ['budget_enforcement', 'roi', 'model_recommendations']);
+    assert.equal(body.kernel.kind, 'trusted_epistemic_kernel_billing');
+    assert.equal(body.kernel.claims.length, 1);
+    assert.equal(body.kernel.claims[0]!.proposition.predicate, 'billing.billed_period_total');
+    assert.equal(body.kernel.claims[0]!.profile.monetaryBasis, 'billed');
+    assert.equal(body.kernel.claims[0]!.profile.authenticity, 'self_asserted');
+    assert.equal(body.kernel.claims[0]!.evidenceIds.length, 2);
 
     const overview = await fetch(`${srv.base}/api/overview?range=all`);
     assert.equal(overview.status, 200);
